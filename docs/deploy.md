@@ -61,9 +61,75 @@ are mandatory. All others are optional.
 | `CERTOMANCER_NO_WEB_UI` | 0 or 1 | If 1, disable web UI and only expose PKI services enumerated in config file. |
 | `CERTOMANCER_NO_EXTRA_CONFIG` | 0 or 1 | If 1, all PKI architecture definitions must be contained in the main configuration file. |
 | `CERTOMANCER_NO_TIME_OVERRIDE` | 0 or 1 | If 1, the Animator's per-request time override functionality is disabled. |
+| `CERTOMANCER_RESTRICTED` | 0 or 1 (strict) | If 1, enable public-only restricted mode (see below). Any other value aborts startup. |
+| `CERTOMANCER_ALLOW_PLUGIN_ENDPOINTS` | 0 or 1 (strict) | If 1 (together with `CERTOMANCER_RESTRICTED`), allow plugin endpoints. Rejected values abort startup. |
 
 
-About the last flag: by default, a test client making requests to an Animator instance can include
-the `X-Certomancer-Fake-Time` header with an ISO 8601 datetime to tell Certomancer to simulate
+About the time override flag: by default, a test client making requests to an Animator instance can
+include the `X-Certomancer-Fake-Time` header with an ISO 8601 datetime to tell Certomancer to simulate
 a particular point in time when preparing a response for the request. If left out, the current time
 will be used.
+
+Boolean environment flags are parsed permissively (as they always were), except the two
+restricted-mode flags above. For those, only `0` and `1` are accepted; a value such as `yes` or
+`true` makes the process fail closed instead of silently starting unrestricted.
+
+
+## Publishing a shared instance without private keys
+
+A shared Certomancer instance signs CRLs, OCSP responses and timestamps with real (test) private
+keys. Those keys must never be downloadable by the clients using the service. Certomancer has a
+public-only *restricted mode* that exposes certificates, CRLs, OCSP and TSA endpoints while
+denying every private key export path.
+
+Enable it in the configuration file:
+
+```yaml
+restricted-mode:
+  enabled: true
+  # optional, defaults to false
+  allow-plugins: false
+```
+
+or with the CLI/WSGI equivalents:
+
+```bash
+# local style, still restricted
+certomancer --config certomancer.yml --restricted animate
+
+# WSGI entrypoint
+CERTOMANCER_RESTRICTED=1 uwsgi --ini certomancer.ini
+```
+
+In restricted mode:
+
+| Endpoint | Behaviour |
+| --- | --- |
+| `GET /<arch>/certs/...`, `GET /<arch>/attr-certs/...` | served (public certificates only) |
+| `GET /<arch>/crls/...` | served |
+| `POST /<arch>/ocsp/<label>` | served |
+| `POST /<arch>/tsa/<label>` | served |
+| `POST /_certomancer/pfx-download/<arch>` | **403**, even when the web UI is disabled |
+| `GET /_certomancer/cert-bundle/<arch>` | served, always without PFX entries |
+| `POST /<arch>/plugin/...` | **403** unless `allow-plugins: true` |
+| `certomancer summon --as-pfx`, `mass-summon` (with PFX) | rejected |
+| PKCS#11 (`alch`) export | rejected |
+
+Denials are enforced at three layers, not by hiding links:
+
+1. the HTTP adapters (WSGI and aiohttp) answer `403 Forbidden` with an explanatory message;
+2. `PKIArchitecture.package_pkcs12`, `dump_certs(include_pkcs12=True)` and
+   `zip_certs(include_pkcs12=True)` raise `PrivateKeyExportDisabled` for any caller;
+3. plugin invocations are refused in `ServiceRegistry.invoke_plugin`.
+
+`--no-web-ui` and `CERTOMANCER_NO_WEB_UI=1` remain available, but they are not a substitute for
+restricted mode: a shared instance should still pass `--restricted` (or the environment flag) so
+that export requests are explicitly rejected rather than merely returning 404.
+
+If the configuration is invalid (bad `restricted-mode` value, missing keysets, a typo in a
+security-relevant environment flag), the WSGI entrypoint answers `500` and logs the problem
+instead of serving requests; the CLI exits with a `Configuration problem` error. There is no
+fallback to an unrestricted instance.
+
+See [example-restricted.yml](../example-restricted.yml) for a complete, directly usable
+configuration.

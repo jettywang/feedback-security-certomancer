@@ -15,6 +15,27 @@ class CertomancerServiceError(Exception):
     pass
 
 
+class RestrictedServiceError(CertomancerServiceError):
+    """
+    Raised when a deployment policy forbids a service operation.
+
+    In public-only mode this maps to HTTP 403 in both Animator adapters.
+    """
+
+    pass
+
+
+class PrivateKeyExportDisabled(RestrictedServiceError):
+    """
+    Raised when private key material would leave the PKI architecture.
+
+    This is deliberately a hard error rather than a silent omission, so
+    misconfigured export paths fail closed.
+    """
+
+    pass
+
+
 def get_nonce() -> int:
     """
     Generate a random 8-byte integer

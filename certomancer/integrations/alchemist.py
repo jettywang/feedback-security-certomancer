@@ -278,6 +278,11 @@ class Alchemist:
             .. note::
                 The private keys for these certificates will not be saved.
         """
+        # Writing private keys to a token is an export path: a shared
+        # deployment must not let callers pull keys off the process.
+        self.pki_arch.service_policy.assert_private_key_export_allowed(
+            'PKCS#11 key export'
+        )
 
         extra_cert_lbls: Set[CertLabel]
         if include_chains:

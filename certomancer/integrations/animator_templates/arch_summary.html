@@ -42,6 +42,12 @@
     </section>
     <section>
         <h3>Download PKCS&nbsp;#12 (.pfx) bundles</h3>
+        {% if restricted %}
+            <p>
+                PFX downloads are disabled: this Animator runs in
+                public-only restricted mode and does not export private keys.
+            </p>
+        {% else %}
         <p>
             Choose a certificate label that you want to download
             together with its issuance chain and private key.
@@ -86,6 +92,7 @@
                 </tfoot>
             </table>
         </form>
+        {% endif %}
     </section>
     <section>
         <h3>Time stamping endpoints (RFC 3161 protocol)</h3>

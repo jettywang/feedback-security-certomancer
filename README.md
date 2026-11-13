@@ -27,6 +27,17 @@ This will run the Certomancer Animator WSGI app on your local machine, behind a 
 server. Point your browser to `http://localhost:9000` and take a look around.
 For more information, see the [documentation](#Documentation) below.
 
+When you publish a Certomancer instance for a team, use public-only restricted mode so that the
+test private keys never leave the server:
+
+```bash
+$ certomancer --config example-restricted.yml animate --no-web-ui
+```
+
+Restricted mode keeps certificates, CRLs, OCSP and TSA available, and explicitly refuses PFX
+downloads, keyed ZIP bundles, plugin endpoints and CLI key exports. See
+[Deploying Certomancer](docs/deploy.md#publishing-a-shared-instance-without-private-keys).
+
 
 ## Installing the development version
 

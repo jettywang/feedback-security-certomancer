@@ -36,6 +36,17 @@ The following flags should be passed before any subcommands.
 | `--key-root` | dirname | Root folder for paths to keys. The default is the folder containing the configuration file. |
 | `--extra-config-root` | dirname | Folder to look for external [PKI architecture files](config.md#pki-architecture-definitions). The default is the folder containing the configuration file. |
 | `--no-external-config` | none | Disable external PKI architecture files altogether. |
+| `--restricted` | none | Enable public-only restricted mode: certificates, CRLs, OCSP and TSA stay available, all private key export paths are refused. |
+| `--allow-plugin-endpoints` | none | In restricted mode, allow plugin service endpoints (off by default). |
+
+
+## Public-only mode
+
+For a shared test deployment, pass `--restricted` (or set `CERTOMANCER_RESTRICTED=1` when using the
+WSGI entrypoint). Certificate, CRL, OCSP and TSA services keep working, while PFX downloads,
+ZIP bundles containing keys, plugin endpoints and the CLI export commands are explicitly refused.
+See [Deploying Certomancer](deploy.md#publishing-a-shared-instance-without-private-keys) for the
+full behaviour matrix.
 
 
 ## Running the Animator locally
@@ -101,7 +112,7 @@ The `mass-summon` subcommand takes the following flags and options.
 | ---- | -------- | --- |
 |`--flat` | none | Do not group certificates by issuer. |
 |`--archive` | none | Write the certificates to a `.zip` archive instead of a directory. |
-|`--no-pfx` | string | Do not attempt to generate PKCS#12 files.|
+|`--no-pfx` | string | Do not attempt to generate PKCS#12 files. Required in restricted mode, where PKCS#12 generation is refused.|
 |`--pfx-pass` | string | Set the passphrase for the PFX files to be generated. |
 |`--no-pem` | none | Do not PEM-armour the certificates, just output their raw DER encoding. |
 

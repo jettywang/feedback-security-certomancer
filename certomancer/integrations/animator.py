@@ -4,10 +4,12 @@ from datetime import datetime
 from io import BytesIO
 from typing import Callable, Dict, Optional
 
+import yaml
 from asn1crypto import ocsp, pem, tsp
 from dateutil.parser import parse as parse_dt
 from werkzeug.exceptions import (
     BadRequest,
+    Forbidden,
     HTTPException,
     InternalServerError,
     NotFound,
@@ -16,6 +18,7 @@ from werkzeug.routing import BaseConverter, Map, Rule, Submount
 from werkzeug.wrappers import Request, Response
 
 from certomancer.config_utils import ConfigurationError
+from certomancer.policy import ServicePolicy
 from certomancer.registry import (
     ArchLabel,
     CertLabel,
@@ -27,7 +30,7 @@ from certomancer.registry import (
     PluginServiceRequestError,
     ServiceLabel,
 )
-from certomancer.services import CertomancerServiceError
+from certomancer.services import CertomancerServiceError, RestrictedServiceError
 
 from ._animator_shared import (
     FAKE_TIME_HEADER,
@@ -52,6 +55,29 @@ class PemExtensionConverter(BaseConverter):
 
     def to_url(self, value):
         return self.expected_exts[0] + ('.pem' if value else '')
+
+
+def restricted_export_rules():
+    """
+    Deny rules for key export paths, used when the web UI is disabled.
+
+    Without these rules a restricted server started with ``--no-web-ui``
+    would answer 404 for PFX requests. A 404 hides the path but does not
+    prove the export is blocked, so we register the route explicitly and
+    let the policy raise 403.
+    """
+    return [
+        Submount(
+            "/" + WEB_UI_URL_PREFIX,
+            [
+                Rule(
+                    '/pfx-download/<arch>',
+                    endpoint='pfx-download',
+                    methods=('POST',),
+                ),
+            ],
+        ),
+    ]
 
 
 def web_ui_rules():
@@ -175,14 +201,33 @@ class Animator:
         at_time: Optional[datetime] = None,
         with_web_ui=True,
         allow_time_override=True,
+        service_policy: Optional[ServicePolicy] = None,
     ):
         self.fixed_time = at_time
         self.architectures = architectures
         self.with_web_ui = with_web_ui
         self.allow_time_override = allow_time_override
+        if service_policy is None:
+            # Derive the policy from the architectures so that library
+            # users cannot accidentally build an unrestricted Animator
+            # around a restricted configuration.
+            service_policy = ServicePolicy()
+            for arch in architectures:
+                service_policy = service_policy.merge(arch.service_policy)
+        self.service_policy = service_policy
+
+        if with_web_ui:
+            extra_rules = web_ui_rules()
+        elif self.service_policy.restricted:
+            # Even without the web UI, restricted mode must answer the
+            # historical PFX path with 403 rather than 404, so that the
+            # policy is enforced explicitly instead of only hiding a route.
+            extra_rules = restricted_export_rules()
+        else:
+            extra_rules = []
 
         self.url_map = Map(
-            service_rules() + (web_ui_rules() if with_web_ui else []),
+            service_rules() + extra_rules,
             converters={'ext': PemExtensionConverter},
         )
 
@@ -194,17 +239,23 @@ class Animator:
             'attr-certs': self.serve_attr_cert,
             'attr-certs-by-holder': self.serve_attr_certs_of_holder,
             'plugin': self.serve_plugin,
+            'pfx-download': self.serve_pfx,
         }
 
         if with_web_ui:
-            self.index_html = gen_index(iter(architectures))
+            # The index stays available in restricted mode to keep the
+            # public service catalogue discoverable. Only the endpoints that
+            # hand out private keys are denied, and they are denied at the
+            # handler level as well (see serve_pfx).
+            self.index_html = gen_index(
+                iter(architectures), service_policy=self.service_policy
+            )
             handlers.update(
                 {
                     'any-cert': self.serve_any_cert,
                     'any-attr-cert': self.serve_any_attr_cert,
                     'attr-certs-of': self.serve_all_attr_certs_of_holder,
                     'cert-bundle': self.serve_zip,
-                    'pfx-download': self.serve_pfx,
                 }
             )
 
@@ -399,6 +450,11 @@ class Animator:
     def serve_plugin(
         self, request: Request, plugin_label: str, *, label: str, arch: str
     ):
+        # Deny before touching plugin configuration, so that a restricted
+        # deployment never invokes arbitrary plugin code.
+        self.service_policy.assert_plugin_endpoint_allowed(
+            f"{plugin_label}/{label}"
+        )
         pki_arch = self.architectures[ArchLabel(arch)]
         services = pki_arch.service_registry
         plugin_lbl = PluginLabel(plugin_label)
@@ -424,7 +480,9 @@ class Animator:
         except KeyError:
             raise NotFound()
         zip_buffer = BytesIO()
-        pki_arch.zip_certs(zip_buffer)
+        # Explicitly pass include_pkcs12=False: keyed bundles are a private
+        # key export path, and the architecture layer would reject them.
+        pki_arch.zip_certs(zip_buffer, include_pkcs12=False)
         zip_buffer.seek(0)
         data = zip_buffer.read()
         cd_header = f'attachment; filename="{arch}-certificates.zip"'
@@ -435,6 +493,12 @@ class Animator:
         )
 
     def serve_pfx(self, request: Request, *, arch):
+        # Reject unconditionally in restricted mode, before parsing the
+        # request body or looking at the architecture. This keeps the
+        # response deterministic and avoids leaking key availability.
+        self.service_policy.assert_private_key_export_allowed(
+            'PFX download endpoint'
+        )
         pki_arch = self.architectures[ArchLabel(arch)]
         try:
             cert = request.form['cert']
@@ -468,6 +532,9 @@ class Animator:
         except CertomancerObjectNotFoundError as e:
             logger.info(e)
             return NotFound()
+        except RestrictedServiceError as e:
+            logger.warning(e)
+            return Forbidden(str(e))
         except CertomancerServiceError as e:
             logger.error(e)
             return InternalServerError()
@@ -480,8 +547,27 @@ class Animator:
         return resp(environ, start_response)
 
 
-def _check_env_flag(env, flag_name):
-    val = env.get(flag_name, '0')
+def _check_env_flag(env, flag_name, strict=False):
+    """
+    Parse a boolean environment flag.
+
+    Security-relevant flags (``strict=True``) only accept ``0``/``1``:
+    a typo such as ``CERTOMANCER_RESTRICTED=yes`` raises instead of
+    silently leaving a shared server unrestricted. Legacy UI/behaviour
+    flags keep their historical permissive parsing.
+    """
+    raw = env.get(flag_name)
+    if raw is None:
+        return False
+    val = raw.strip()
+    if val == '1':
+        return True
+    if val == '0':
+        return False
+    if strict:
+        raise ConfigurationError(
+            f"Environment variable {flag_name} must be 0 or 1, got {raw!r}."
+        )
     try:
         return bool(int(val))
     except ValueError:
@@ -496,14 +582,28 @@ class LazyAnimator:
         if self.animator is not None:
             return
         env = os.environ
-        cfg_file = env['CERTOMANCER_CONFIG']
-        key_dir = env['CERTOMANCER_KEY_DIR']
+        try:
+            cfg_file = env['CERTOMANCER_CONFIG']
+            key_dir = env['CERTOMANCER_KEY_DIR']
+        except KeyError as e:
+            raise ConfigurationError(
+                f"Required environment variable {e.args[0]} is not set."
+            ) from e
         config_dir = env.get('CERTOMANCER_EXTRA_CONFIG_DIR', None)
         with_web_ui = not _check_env_flag(env, 'CERTOMANCER_NO_WEB_UI')
         extl_config = not _check_env_flag(env, 'CERTOMANCER_NO_EXTRA_CONFIG')
         external_url_prefix_override = env.get('CERTOMANCER_URL_PREFIX', None)
         allow_time_override = not _check_env_flag(
             env, 'CERTOMANCER_NO_TIME_OVERRIDE'
+        )
+        restricted = _check_env_flag(
+            env, 'CERTOMANCER_RESTRICTED', strict=True
+        )
+        allow_plugins = _check_env_flag(
+            env, 'CERTOMANCER_ALLOW_PLUGIN_ENDPOINTS', strict=True
+        )
+        policy = ServicePolicy(
+            restricted=restricted, allow_plugin_endpoints=allow_plugins
         )
 
         cfg = CertomancerConfig.from_file(
@@ -512,15 +612,29 @@ class LazyAnimator:
             config_search_dir=config_dir,
             allow_external_config=extl_config,
             external_url_prefix=external_url_prefix_override or None,
+            service_policy=policy,
         )
         self.animator = Animator(
             AnimatorArchStore(cfg.pki_archs),
             with_web_ui=with_web_ui,
             allow_time_override=allow_time_override,
+            service_policy=cfg.service_policy,
         )
 
     def __call__(self, environ, start_response):
-        self._load()
+        try:
+            self._load()
+        except (ConfigurationError, OSError, yaml.YAMLError) as e:
+            # Fail closed: log the configuration problem and refuse to
+            # serve any request rather than exposing a half-configured
+            # Animator (which might still have key export routes).
+            logger.error("Certomancer configuration error: %s", e)
+            response = Response(
+                "Certomancer configuration error; see server logs.\n",
+                status=500,
+                mimetype='text/plain',
+            )
+            return response(environ, start_response)
         return self.animator(environ, start_response)
 
 

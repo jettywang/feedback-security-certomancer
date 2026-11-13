@@ -7,6 +7,7 @@ from typing import Optional
 import yaml
 
 from ..config_utils import ConfigurationError, SearchDir
+from ..policy import ServicePolicy
 from .common import ArchLabel
 from .keys import KeySets
 from .pki_arch import PKIArchitecture
@@ -17,6 +18,13 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_PLUGIN_MODULE = "certomancer.default_plugins"
+
+
+def _load_yaml(source):
+    try:
+        return yaml.safe_load(source)
+    except yaml.YAMLError as e:
+        raise ConfigurationError(f"Failed to parse YAML configuration: {e}")
 
 
 def _import_plugin_modules(plugins):
@@ -52,13 +60,21 @@ class CertomancerConfig:
         key_search_dir,
         config_search_dir=None,
         external_url_prefix=None,
+        service_policy: Optional[ServicePolicy] = None,
     ) -> 'CertomancerConfig':
-        config_dict = yaml.safe_load(yaml_str)
+        config_dict = _load_yaml(yaml_str)
+        if config_dict is None:
+            config_dict = {}
+        if not isinstance(config_dict, dict):
+            raise ConfigurationError(
+                "Top-level Certomancer configuration must be a dictionary."
+            )
         return CertomancerConfig(
             config_dict,
             key_search_dir=key_search_dir,
             config_search_dir=config_search_dir,
             external_url_prefix=external_url_prefix,
+            service_policy=service_policy,
         )
 
     @classmethod
@@ -69,6 +85,7 @@ class CertomancerConfig:
         config_search_dir=None,
         allow_external_config=True,
         external_url_prefix=None,
+        service_policy: Optional[ServicePolicy] = None,
     ) -> 'CertomancerConfig':
         main_config_dir = os.path.dirname(cfg_path)
         if not allow_external_config:
@@ -77,12 +94,19 @@ class CertomancerConfig:
             config_search_dir = main_config_dir
         key_search_dir = key_search_dir or main_config_dir
         with open(cfg_path, 'r') as inf:
-            config_dict = yaml.safe_load(inf)
+            config_dict = _load_yaml(inf)
+        if config_dict is None:
+            config_dict = {}
+        if not isinstance(config_dict, dict):
+            raise ConfigurationError(
+                "Top-level Certomancer configuration must be a dictionary."
+            )
         return CertomancerConfig(
             config_dict,
             key_search_dir=key_search_dir,
             config_search_dir=config_search_dir,
             external_url_prefix=external_url_prefix,
+            service_policy=service_policy,
         )
 
     def __init__(
@@ -92,11 +116,25 @@ class CertomancerConfig:
         lazy_load_keys=False,
         config_search_dir: Optional[str] = None,
         external_url_prefix=None,
+        service_policy: Optional[ServicePolicy] = None,
     ):
+        if not isinstance(config, dict):
+            raise ConfigurationError(
+                "Certomancer configuration must be a dictionary."
+            )
         if external_url_prefix is None:
             self.external_url_prefix = external_url_prefix = config.get(
                 'external-url-prefix', self.DEFAULT_EXTERNAL_URL_PREFIX
             )
+
+        # A policy supplied by the caller (e.g. CLI/WSGI environment) is
+        # merged with the config file policy so that neither source can
+        # weaken the other.
+        file_policy = ServicePolicy.from_config(
+            config.get('restricted-mode', None)
+        )
+        self.service_policy = file_policy.merge(service_policy)
+        self.restricted_mode = self.service_policy.restricted
 
         extn_plugin_list = config.get('plugin-modules', ())
         _import_plugin_modules(extn_plugin_list)
@@ -132,6 +170,7 @@ class CertomancerConfig:
                 arch_cfgs,
                 external_url_prefix=external_url_prefix,
                 config_search_dir=search_dir,
+                service_policy=self.service_policy,
             )
         }
 

@@ -19,6 +19,7 @@ from ..config_utils import (
     key_dashes_to_underscores,
 )
 from ..crypto_utils import load_cert_from_pemder
+from ..policy import ServicePolicy
 from ..services import (
     CertomancerServiceError,
     CRLBuilder,
@@ -289,6 +290,7 @@ class PKIArchitecture:
         config_search_dir: Optional[SearchDir] = None,
         cert_cache=None,
         ac_cache=None,
+        service_policy: Optional[ServicePolicy] = None,
     ) -> 'PKIArchitecture':
         check_config_keys(arch_label, PKIArchitecture.CONFIG_KEYS, cfg)
         key_set_label = cfg.get('keyset', arch_label)
@@ -332,6 +334,7 @@ class PKIArchitecture:
             ac_spec_config=ac_specs,
             cert_cache=cert_cache,
             ac_cache=ac_cache,
+            service_policy=service_policy,
         )
 
     @classmethod
@@ -343,6 +346,7 @@ class PKIArchitecture:
         config_search_dir: Optional[SearchDir],
         extension_plugins: Optional[ExtensionPluginRegistry] = None,
         service_plugins: Optional['ServicePluginRegistry'] = None,
+        service_policy: Optional[ServicePolicy] = None,
     ):
         arch_specs: Dict[ArchLabel, Dict[str, Any]] = {}
         for lbl, cfg in cfgs.items():
@@ -419,6 +423,7 @@ class PKIArchitecture:
                 extension_plugins=extension_plugins,
                 config_search_dir=config_search_dir,
                 service_plugins=service_plugins,
+                service_policy=service_policy,
             )
 
     def __init__(
@@ -437,10 +442,12 @@ class PKIArchitecture:
         config_search_dir: Optional[SearchDir] = None,
         cert_cache=None,
         ac_cache=None,
+        service_policy: Optional[ServicePolicy] = None,
     ):
         self.arch_label = arch_label
         self.key_set = key_set
         self.entities = entities
+        self.service_policy = service_policy or ServicePolicy()
 
         self.extn_plugin_registry = (
             extension_plugins or plugin_api.extension_plugin_registry
@@ -610,6 +617,11 @@ class PKIArchitecture:
         certs_to_embed: Optional[Iterable[CertLabel]] = None,
         password: Optional[bytes] = None,
     ):
+        # PKCS#12 always bundles a private key, so this is a key export
+        # path no matter which caller invokes it.
+        self.service_policy.assert_private_key_export_allowed(
+            'PKCS#12 (PFX) export'
+        )
         try:
             from cryptography import x509 as pyca_x509
             from cryptography.hazmat.primitives.asymmetric import (
@@ -682,6 +694,11 @@ class PKIArchitecture:
     def _dump_certs(
         self, use_pem=True, flat=False, include_pkcs12=False, pkcs12_pass=None
     ):
+        if include_pkcs12:
+            # Fail before producing a partial archive.
+            self.service_policy.assert_private_key_export_allowed(
+                'Bulk certificate export with PKCS#12 bundles'
+            )
         # start writing only after we know that all certs have been built
         ext = '.cert.pem' if use_pem else '.crt'
         for iss_label, iss_certs in self._cert_labels_by_issuer.items():
@@ -729,6 +746,10 @@ class PKIArchitecture:
         include_pkcs12=False,
         pkcs12_pass=None,
     ):
+        if include_pkcs12:
+            self.service_policy.assert_private_key_export_allowed(
+                'Bulk certificate export with PKCS#12 bundles'
+            )
         os.makedirs(folder_path, exist_ok=True)
         self._load_all_certs()
         itr_certs = self._dump_certs(
@@ -1417,6 +1438,9 @@ class ServiceRegistry:
         request: bytes,
         at_time: Optional[datetime] = None,
     ) -> bytes:
+        self.pki_arch.service_policy.assert_plugin_endpoint_allowed(
+            f"{plugin_label}/{label}"
+        )
         info = self.get_plugin_info(plugin_label, label)
         return self.plugins.invoke_plugin(
             self.pki_arch, info, request, at_time=at_time

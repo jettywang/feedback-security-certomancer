@@ -8,6 +8,7 @@ from asn1crypto import ocsp, pem, tsp
 from dateutil.parser import parse as parse_dt
 
 from certomancer.config_utils import ConfigurationError
+from certomancer.policy import ServicePolicy
 from certomancer.registry import (
     ArchLabel,
     CertLabel,
@@ -18,7 +19,7 @@ from certomancer.registry import (
     PluginServiceRequestError,
     ServiceLabel,
 )
-from certomancer.services import CertomancerServiceError
+from certomancer.services import CertomancerServiceError, RestrictedServiceError
 
 from ._animator_shared import (
     FAKE_TIME_HEADER,
@@ -51,6 +52,9 @@ async def _error_middleware(request, handler):
         raise web.HTTPNotFound()
     except PluginServiceRequestError as e:
         raise web.HTTPBadRequest(text=e.user_msg)
+    except RestrictedServiceError as e:
+        logger.warning(e)
+        raise web.HTTPForbidden(text=str(e))
     except CertomancerServiceError as e:
         logger.error(e)
         raise web.HTTPInternalServerError()
@@ -61,10 +65,16 @@ def build_animator_app(
     at_time: Optional[datetime] = None,
     with_web_ui: bool = True,
     allow_time_override: bool = True,
+    service_policy: Optional[ServicePolicy] = None,
 ) -> web.Application:
     """Build an aiohttp web.Application that mirrors the WSGI Animator."""
 
     fixed_time = at_time
+    if service_policy is None:
+        # Derive the policy from the architectures, as in the WSGI Animator.
+        service_policy = ServicePolicy()
+        for pki_arch in architectures.values():
+            service_policy = service_policy.merge(pki_arch.service_policy)
 
     def _resolve_time(request: web.Request) -> datetime:
         if allow_time_override:
@@ -248,6 +258,11 @@ def build_animator_app(
         arch = request.match_info['arch']
         label = request.match_info['label']
         plugin_label_str = request.match_info['plugin_label']
+        # Check the policy before resolving the architecture or reading the
+        # body, mirroring the WSGI Animator.
+        service_policy.assert_plugin_endpoint_allowed(
+            f"{plugin_label_str}/{label}"
+        )
         pki_arch = _get_arch(architectures, arch)
         services = pki_arch.service_registry
         plugin_lbl = PluginLabel(plugin_label_str)
@@ -311,7 +326,8 @@ def build_animator_app(
         arch = request.match_info['arch']
         pki_arch = _get_arch(architectures, arch)
         zip_buffer = BytesIO()
-        pki_arch.zip_certs(zip_buffer)
+        # Explicitly exclude keyed bundles; see the WSGI Animator.
+        pki_arch.zip_certs(zip_buffer, include_pkcs12=False)
         zip_buffer.seek(0)
         body = zip_buffer.read()
         cd_header = f'attachment; filename="{arch}-certificates.zip"'
@@ -322,6 +338,10 @@ def build_animator_app(
         )
 
     async def serve_pfx(request: web.Request) -> web.Response:
+        # Reject before parsing the form body; see the WSGI Animator.
+        service_policy.assert_private_key_export_allowed(
+            'PFX download endpoint'
+        )
         arch = request.match_info['arch']
         pki_arch = _get_arch(architectures, arch)
         post_data = await request.post()
@@ -384,7 +404,9 @@ def build_animator_app(
     )
 
     if with_web_ui:
-        index_html = gen_index(architectures.values())
+        index_html = gen_index(
+            architectures.values(), service_policy=service_policy
+        )
 
         async def serve_index(request: web.Request) -> web.Response:
             return web.Response(body=index_html, content_type='text/html')
@@ -408,6 +430,13 @@ def build_animator_app(
             prefix + '/cert-bundle/{arch}',
             serve_cert_bundle,
         )
+        router.add_post(
+            prefix + '/pfx-download/{arch}',
+            serve_pfx,
+        )
+    elif service_policy.restricted:
+        # Keep the denial explicit (HTTP 403) even when the web UI is off.
+        prefix = '/' + WEB_UI_URL_PREFIX
         router.add_post(
             prefix + '/pfx-download/{arch}',
             serve_pfx,

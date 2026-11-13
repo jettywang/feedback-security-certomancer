@@ -10,6 +10,7 @@ from dateutil.parser import parse as parse_dt
 
 from ._asn1_types import register_extensions
 from .config_utils import ConfigurationError
+from .policy import ServicePolicy
 from .registry import (
     ArchLabel,
     AttributeCertificateSpec,
@@ -18,7 +19,7 @@ from .registry import (
     CertomancerConfig,
     ServiceLabel,
 )
-from .services import CertomancerServiceError
+from .services import CertomancerServiceError, PrivateKeyExportDisabled
 from .version import __version__
 
 DEFAULT_CONFIG_FILE = 'certomancer.yml'
@@ -47,6 +48,9 @@ def exception_manager():
         yield
     except click.ClickException:
         raise
+    except PrivateKeyExportDisabled as e:
+        msg = f"Restricted mode: {str(e)}"
+        exc = e
     except ConfigurationError as e:
         msg = f"Configuration problem: {str(e)}"
         exc = e
@@ -60,7 +64,12 @@ def exception_manager():
 
 
 def _lazy_cfg(
-    config, key_root, cfg_root, no_external_config, service_url_prefix
+    config,
+    key_root,
+    cfg_root,
+    no_external_config,
+    service_url_prefix,
+    service_policy=None,
 ):
     config = config or DEFAULT_CONFIG_FILE
     try:
@@ -70,6 +79,7 @@ def _lazy_cfg(
             config_search_dir=cfg_root,
             allow_external_config=not no_external_config,
             external_url_prefix=service_url_prefix,
+            service_policy=service_policy,
         )
     except IOError as e:
         raise click.ClickException(
@@ -116,6 +126,22 @@ def _lazy_cfg(
     required=False,
     type=str,
 )
+@click.option(
+    '--restricted',
+    help='public-only mode: serve certificates, OCSP, CRL and TSA, but '
+    'refuse every private key export path',
+    required=False,
+    type=bool,
+    is_flag=True,
+)
+@click.option(
+    '--allow-plugin-endpoints',
+    help='allow plugin service endpoints in restricted mode (disabled by '
+    'default)',
+    required=False,
+    type=bool,
+    is_flag=True,
+)
 @click.pass_context
 @exception_manager()
 def cli(
@@ -125,15 +151,22 @@ def cli(
     extra_config_root,
     no_external_config,
     service_url_prefix,
+    restricted,
+    allow_plugin_endpoints,
 ):
     _log_config()
     ctx.ensure_object(dict)
+    cli_policy = ServicePolicy(
+        restricted=restricted,
+        allow_plugin_endpoints=allow_plugin_endpoints,
+    )
     ctx.obj['config'] = _lazy_cfg(
         config,
         key_root,
         extra_config_root,
         no_external_config,
         service_url_prefix,
+        cli_policy,
     )
 
 
@@ -184,6 +217,13 @@ def mass_summon(
     pfx_pass: str,
 ):
     cfg: CertomancerConfig = next(ctx.obj['config'])
+    if not no_pfx:
+        # mass-summon emits a PFX per certificate by default: that is a
+        # private key export path. Public-only dumps (--no-pfx) remain
+        # available in restricted mode.
+        cfg.service_policy.assert_private_key_export_allowed(
+            "The 'mass-summon' export with PKCS#12 files"
+        )
     pki_arch = cfg.get_pki_arch(ArchLabel(architecture))
     if pfx_pass is not None:
         pfx_pass_bytes = pfx_pass.encode('utf8')
@@ -247,6 +287,10 @@ def summon(
     pfx_pass: str,
 ):
     cfg: CertomancerConfig = next(ctx.obj['config'])
+    if as_pfx:
+        cfg.service_policy.assert_private_key_export_allowed(
+            "The 'summon --as-pfx' command"
+        )
     pki_arch = cfg.get_pki_arch(ArchLabel(architecture))
     output_is_binary = as_pfx or no_pem
 
@@ -517,7 +561,14 @@ def animate(
         AnimatorArchStore(cfg.pki_archs),
         with_web_ui=not no_web_ui,
         allow_time_override=not no_time_override,
+        service_policy=cfg.service_policy,
     )
+    if cfg.service_policy.restricted and no_web_ui:
+        logger.info(
+            "Animator running in public-only restricted mode: "
+            "certificate, OCSP, CRL and TSA services exposed; "
+            "private key exports denied."
+        )
     if wsgi_prefix:
         # Serve the Animator under the indicated prefix, wrapped using
         # dispatcher middleware (functionally equivalent to SCRIPT_NAME, but
@@ -554,7 +605,14 @@ def _animate_aiohttp(
         cfg.pki_archs,
         with_web_ui=not no_web_ui,
         allow_time_override=not no_time_override,
+        service_policy=cfg.service_policy,
     )
+    if cfg.service_policy.restricted and no_web_ui:
+        logger.info(
+            "Animator running in public-only restricted mode: "
+            "certificate, OCSP, CRL and TSA services exposed; "
+            "private key exports denied."
+        )
     # bind both IPv4 and IPv6 loopback (the default for run_animator_app)
     run_animator_app(app, port=port)
 
@@ -617,6 +675,9 @@ def alch(
     from certomancer.integrations import alchemist
 
     cfg: CertomancerConfig = next(ctx.obj['config'])
+    cfg.service_policy.assert_private_key_export_allowed(
+        "The 'alch' PKCS#11 export command"
+    )
     arch = cfg.get_pki_arch(ArchLabel(pki_arch))
 
     session = alchemist.open_pkcs11_session(

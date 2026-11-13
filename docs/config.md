@@ -16,6 +16,9 @@ The typical structure of such a file looks more or less like the following.
 # prefix prepended to all generated URLs
 external-url-prefix: "http://test.test"
 
+# optional: public-only deployment mode for shared instances
+restricted-mode: true
+
 # key set definitions go here
 keysets: ...
 
@@ -37,6 +40,24 @@ pki-architectures:
     # or provided by plugins.
     services: ...
 ```
+
+
+## Restricted mode
+
+The optional top-level `restricted-mode` key enables public-only mode. It accepts a boolean, or a
+dictionary with `enabled` and `allow-plugins` keys:
+
+```yaml
+restricted-mode:
+  enabled: true
+  allow-plugins: false   # default
+```
+
+In this mode, certificate, CRL, OCSP and TSA services remain available. Every private key export
+path — PFX downloads, ZIP bundles containing keys, plugin endpoints (unless allowlisted), the
+`summon --as-pfx`/`mass-summon` CLI exports and PKCS#11 exports — is refused explicitly.
+Invalid values raise a configuration error at load time. See
+[Deploying Certomancer](deploy.md#publishing-a-shared-instance-without-private-keys) for details.
 
 
 ## Key set configuration

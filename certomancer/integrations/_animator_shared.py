@@ -1,7 +1,8 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 
+from certomancer.policy import ServicePolicy
 from certomancer.registry import (
     ArchLabel,
     AttributeCertificateSpec,
@@ -88,7 +89,9 @@ class ArchServicesDescription:
         )
 
 
-def gen_index(architectures):
+def gen_index(
+    architectures, service_policy: Optional[ServicePolicy] = None
+):
     try:
         from jinja2 import Environment, PackageLoader
     except ImportError as e:  # pragma: nocover
@@ -103,9 +106,11 @@ def gen_index(architectures):
         autoescape=True,
     )
     template = jinja_env.get_template('index.html')
+    service_policy = service_policy or ServicePolicy()
     return template.render(
         pki_archs=[
             ArchServicesDescription.compile(arch) for arch in architectures
         ],
         web_ui_prefix=WEB_UI_URL_PREFIX,
+        restricted=service_policy.restricted,
     )
