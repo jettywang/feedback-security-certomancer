@@ -5,7 +5,6 @@ from io import BytesIO
 from typing import Callable, Dict, Optional
 
 from asn1crypto import ocsp, pem, tsp
-from dateutil.parser import parse as parse_dt
 from werkzeug.exceptions import (
     BadRequest,
     HTTPException,
@@ -32,7 +31,7 @@ from certomancer.services import CertomancerServiceError
 from ._animator_shared import (
     FAKE_TIME_HEADER,
     WEB_UI_URL_PREFIX,
-    _now,
+    ServiceTimeContext,
     gen_index,
 )
 
@@ -210,12 +209,18 @@ class Animator:
 
         self._handlers = handlers
 
-    def at_time(self, request):
-        fake_time = None
-        if self.allow_time_override:
-            fake_time = request.headers.get(FAKE_TIME_HEADER, type=parse_dt)
+    def time_context(self, request) -> ServiceTimeContext:
+        # Resolve the time context exactly once per request; the resulting
+        # immutable value is passed explicitly to the services invoked
+        # while handling this request, and never stored on shared state.
+        return ServiceTimeContext.for_request(
+            fake_time_header=request.headers.get(FAKE_TIME_HEADER),
+            fixed_time=self.fixed_time,
+            allow_override=self.allow_time_override,
+        )
 
-        return fake_time or self.fixed_time or _now()
+    def at_time(self, request):
+        return self.time_context(request).effective_time
 
     def serve_ocsp_response(self, request: Request, *, label: str, arch: str):
         pki_arch = self.architectures[ArchLabel(arch)]

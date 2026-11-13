@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
+
+from dateutil.parser import parse as parse_dt
 
 from certomancer.registry import (
     ArchLabel,
@@ -17,6 +19,40 @@ WEB_UI_URL_PREFIX = '_certomancer'
 
 def _now():
     return datetime.now(tz=timezone.utc)
+
+
+@dataclass(frozen=True)
+class ServiceTimeContext:
+    """
+    Explicit, immutable time context for a single request.
+
+    Resolved exactly once per request, with the following precedence:
+
+     1. the ``X-Certomancer-Fake-Time`` header (if overrides are allowed);
+     2. the server's fixed time (if any);
+     3. the wall clock.
+
+    Handlers pass the context's ``effective_time`` down to OCSP, CRL and
+    TSA generation, so concurrent requests simulating different timelines
+    never have to mutate a shared clock or ``fixed_time`` value, and a
+    cancelled request cannot leak its timeline into another one.
+    """
+
+    effective_time: datetime
+
+    @classmethod
+    def for_request(
+        cls,
+        fake_time_header: Optional[str],
+        fixed_time: Optional[datetime] = None,
+        allow_override: bool = True,
+    ) -> 'ServiceTimeContext':
+        effective = None
+        if allow_override and fake_time_header:
+            effective = parse_dt(fake_time_header)
+        if effective is None:
+            effective = fixed_time or _now()
+        return cls(effective_time=effective)
 
 
 @dataclass(frozen=True)

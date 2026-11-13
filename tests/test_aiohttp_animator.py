@@ -4,8 +4,9 @@ Async integration tests for aiohttp_animator.
 Mirrors tests/test_animator.py, adapted for aiohttp's test utilities.
 """
 
+import asyncio
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from zipfile import ZipFile
 
@@ -23,7 +24,7 @@ from freezegun import freeze_time
 from certomancer import CertomancerConfig
 from certomancer.integrations._animator_shared import FAKE_TIME_HEADER
 from certomancer.integrations.aiohttp_animator import build_animator_app
-from certomancer.registry import ArchLabel, KeyLabel
+from certomancer.registry import ArchLabel, CertLabel, KeyLabel, ServiceLabel
 
 CFG = CertomancerConfig.from_file('tests/data/with-services.yml', 'tests/data')
 
@@ -374,3 +375,231 @@ async def test_attr_cert_wrong_arch(client):
         '/nonexistent-arch/attr-certs/role-aa/issued/test-ac.attr.crt'
     )
     assert resp.status == 404
+
+
+# --- concurrent timeline isolation tests ---
+#
+# signer2 is revoked since 2020-12-01T00:00:00Z, so these two fixed
+# timelines observe different revocation states for the same certificate.
+# All requests carry their own X-Certomancer-Fake-Time header; the server
+# must never mix the two timelines up, no matter how requests interleave.
+
+T_BEFORE_REVOCATION = datetime(2020, 11, 5, tzinfo=timezone.utc)
+T_AFTER_REVOCATION = datetime(2020, 12, 29, tzinfo=timezone.utc)
+SIGNER2_REVOKED_SINCE = datetime(2020, 12, 1, tzinfo=timezone.utc)
+
+
+def _fake_time_headers(at_time):
+    if at_time is None:
+        return {}
+    return {FAKE_TIME_HEADER: at_time.strftime('%Y-%m-%dT%H:%M:%S%z')}
+
+
+async def _fetch_ocsp_rdata(client, at_time):
+    with open('tests/data/signer2-ocsp-req.der', 'rb') as req_in:
+        req_data = req_in.read()
+    resp = await client.post(
+        '/testing-ca/ocsp/interm',
+        data=req_data,
+        headers={
+            'Content-Type': 'application/ocsp-request',
+            **_fake_time_headers(at_time),
+        },
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    ocsp_resp = ocsp.OCSPResponse.load(body)
+    assert ocsp_resp['response_status'].native == 'successful'
+    return ocsp_resp['response_bytes']['response'].parsed['tbs_response_data']
+
+
+async def _fetch_tsa_gen_time(client, at_time):
+    hashed_bytes = hashlib.sha256(b'timeline-test').digest()
+    req = tsp.TimeStampReq(
+        {
+            'version': 'v2',
+            'message_imprint': tsp.MessageImprint(
+                {
+                    'hash_algorithm': algos.DigestAlgorithm(
+                        {'algorithm': 'sha256'}
+                    ),
+                    'hashed_message': hashed_bytes,
+                }
+            ),
+            'cert_req': True,
+        }
+    )
+    resp = await client.post(
+        '/testing-ca/tsa/tsa',
+        data=req.dump(),
+        headers={
+            'Content-Type': 'application/timestamp-query',
+            **_fake_time_headers(at_time),
+        },
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    ts_resp = tsp.TimeStampResp.load(body)
+    sd = ts_resp['time_stamp_token']['content']
+    return sd['encap_content_info']['content'].parsed['gen_time'].native
+
+
+async def _fetch_latest_crl(client, at_time):
+    resp = await client.get(
+        '/testing-ca/crls/interm/latest.crl',
+        headers=_fake_time_headers(at_time),
+    )
+    assert resp.status == 200
+    return crl.CertificateList.load(await resp.read())
+
+
+def _expected_crl_schedule(at_time):
+    # Mirror the documented semantics of ServiceRegistry.get_crl:
+    # the CRL number counts update periods since the issuer cert's
+    # notBefore, and thisUpdate sits at the start of the current period.
+    arch = CFG.get_pki_arch(ArchLabel('testing-ca'))
+    svc_reg = arch.service_registry
+    crl_info = svc_reg.get_crl_repo_info(ServiceLabel('interm'))
+    time_origin = arch.get_cert(CertLabel('interm')).not_valid_before
+    time_delta = crl_info.simulated_update_schedule
+    number = (at_time - time_origin) // time_delta
+    return number, time_origin + number * time_delta
+
+
+def _check_ocsp_timeline(rdata, at_time):
+    produced_at = rdata['produced_at'].native
+    # producedAt must reflect this request's own timeline, never the
+    # other request's one
+    assert produced_at == at_time
+    single = rdata['responses'][0]
+    assert single['this_update'].native == at_time
+    assert single['next_update'].native == at_time + timedelta(minutes=10)
+    expected_status = (
+        'good' if at_time < SIGNER2_REVOKED_SINCE else 'revoked'
+    )
+    assert single['cert_status'].name == expected_status
+
+
+def _check_crl_timeline(cert_list, at_time):
+    tbs = cert_list['tbs_cert_list']
+    expected_number, expected_this_update = _expected_crl_schedule(at_time)
+    crl_number = next(
+        ext['extn_value'].native
+        for ext in tbs['crl_extensions']
+        if ext['extn_id'].native == 'crl_number'
+    )
+    assert crl_number == expected_number
+    assert tbs['this_update'].native == expected_this_update
+    expected_revoked = 0 if at_time < SIGNER2_REVOKED_SINCE else 1
+    assert len(tbs['revoked_certificates']) == expected_revoked
+
+
+@pytest.mark.asyncio
+async def test_interleaved_timelines_ocsp(client):
+    timelines = [T_BEFORE_REVOCATION, T_AFTER_REVOCATION] * 4
+    rdatas = await asyncio.gather(
+        *(_fetch_ocsp_rdata(client, at_time) for at_time in timelines)
+    )
+    for at_time, rdata in zip(timelines, rdatas):
+        _check_ocsp_timeline(rdata, at_time)
+
+
+@pytest.mark.asyncio
+async def test_interleaved_timelines_tsa(client):
+    timelines = [T_BEFORE_REVOCATION, T_AFTER_REVOCATION] * 4
+    gen_times = await asyncio.gather(
+        *(_fetch_tsa_gen_time(client, at_time) for at_time in timelines)
+    )
+    assert list(gen_times) == timelines
+
+
+@pytest.mark.asyncio
+async def test_interleaved_timelines_crl(client):
+    timelines = [T_BEFORE_REVOCATION, T_AFTER_REVOCATION] * 4
+    cert_lists = await asyncio.gather(
+        *(_fetch_latest_crl(client, at_time) for at_time in timelines)
+    )
+    for at_time, cert_list in zip(timelines, cert_lists):
+        _check_crl_timeline(cert_list, at_time)
+
+
+@pytest.mark.asyncio
+async def test_interleaved_timelines_repeatable(client):
+    # Repeating the same interleaved batch must yield exactly the same
+    # producedAt/genTime values: results are fully explained by the
+    # per-request time context, not by wall-clock or shared state.
+    timelines = [T_BEFORE_REVOCATION, T_AFTER_REVOCATION] * 2
+
+    async def _run_batch():
+        ocsp_rdatas, gen_times = await asyncio.gather(
+            asyncio.gather(
+                *(_fetch_ocsp_rdata(client, t) for t in timelines)
+            ),
+            asyncio.gather(
+                *(_fetch_tsa_gen_time(client, t) for t in timelines)
+            ),
+        )
+        produced = [rd['produced_at'].native for rd in ocsp_rdatas]
+        return produced, list(gen_times)
+
+    first = await _run_batch()
+    second = await _run_batch()
+    assert first == second
+    assert first[0] == timelines
+    assert first[1] == timelines
+
+
+@pytest.mark.asyncio
+async def test_cancelled_request_does_not_leak_time(client):
+    # Cancel a request on the post-revocation timeline; the concurrent
+    # pre-revocation request must still complete on its own timeline,
+    # and the service must remain consistent afterwards.
+    before_task = asyncio.ensure_future(
+        _fetch_ocsp_rdata(client, T_BEFORE_REVOCATION)
+    )
+    after_task = asyncio.ensure_future(
+        _fetch_ocsp_rdata(client, T_AFTER_REVOCATION)
+    )
+    await asyncio.sleep(0)
+    after_task.cancel()
+    try:
+        rdata = await after_task
+    except asyncio.CancelledError:
+        pass
+    else:
+        # the server finished before the cancellation landed; even then
+        # the result must carry the cancelled request's own timeline
+        _check_ocsp_timeline(rdata, T_AFTER_REVOCATION)
+
+    rdata = await before_task
+    _check_ocsp_timeline(rdata, T_BEFORE_REVOCATION)
+
+    # the cancelled timeline is still served correctly afterwards
+    rdata_after = await _fetch_ocsp_rdata(client, T_AFTER_REVOCATION)
+    _check_ocsp_timeline(rdata_after, T_AFTER_REVOCATION)
+    gen_time = await _fetch_tsa_gen_time(client, T_AFTER_REVOCATION)
+    assert gen_time == T_AFTER_REVOCATION
+
+
+@pytest.mark.asyncio
+async def test_fixed_time_app_still_honoured():
+    # The original fixed-time usage is unchanged: without the override
+    # header every request uses the app's fixed time, and the header
+    # still takes precedence when allowed.
+    fixed = datetime(2020, 11, 5, tzinfo=timezone.utc)
+    app = build_animator_app(
+        CFG.pki_archs, at_time=fixed, with_web_ui=False
+    )
+    async with TestClient(TestServer(app)) as fixed_client:
+        rdata1, rdata2, gen_time = await asyncio.gather(
+            _fetch_ocsp_rdata(fixed_client, None),
+            _fetch_ocsp_rdata(fixed_client, None),
+            _fetch_tsa_gen_time(fixed_client, None),
+        )
+        _check_ocsp_timeline(rdata1, fixed)
+        _check_ocsp_timeline(rdata2, fixed)
+        assert gen_time == fixed
+
+        # per-request override still wins over the fixed time
+        rdata = await _fetch_ocsp_rdata(fixed_client, T_AFTER_REVOCATION)
+        _check_ocsp_timeline(rdata, T_AFTER_REVOCATION)

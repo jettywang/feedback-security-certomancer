@@ -5,7 +5,6 @@ from typing import Dict, Optional, Sequence, Union
 
 from aiohttp import web
 from asn1crypto import ocsp, pem, tsp
-from dateutil.parser import parse as parse_dt
 
 from certomancer.config_utils import ConfigurationError
 from certomancer.registry import (
@@ -23,7 +22,7 @@ from certomancer.services import CertomancerServiceError
 from ._animator_shared import (
     FAKE_TIME_HEADER,
     WEB_UI_URL_PREFIX,
-    _now,
+    ServiceTimeContext,
     gen_index,
 )
 
@@ -66,21 +65,25 @@ def build_animator_app(
 
     fixed_time = at_time
 
-    def _resolve_time(request: web.Request) -> datetime:
-        if allow_time_override:
-            header = request.headers.get(FAKE_TIME_HEADER)
-            if header:
-                return parse_dt(header)
-        return fixed_time or _now()
+    def _resolve_time_ctx(request: web.Request) -> ServiceTimeContext:
+        # Resolve the time context exactly once per request; the resulting
+        # immutable value is passed explicitly to the services invoked
+        # while handling this request, and never stored on shared state.
+        return ServiceTimeContext.for_request(
+            fake_time_header=request.headers.get(FAKE_TIME_HEADER),
+            fixed_time=fixed_time,
+            allow_override=allow_time_override,
+        )
 
     # --- service handlers ---
 
     async def serve_ocsp(request: web.Request) -> web.Response:
         arch = request.match_info['arch']
         label = request.match_info['label']
+        time_ctx = _resolve_time_ctx(request)
         pki_arch = _get_arch(architectures, arch)
         ocsp_resp = pki_arch.service_registry.summon_responder(
-            ServiceLabel(label), _resolve_time(request)
+            ServiceLabel(label), time_ctx.effective_time
         )
         data = await request.read()
         req: ocsp.OCSPRequest = ocsp.OCSPRequest.load(data)
@@ -93,9 +96,10 @@ def build_animator_app(
     async def serve_tsa(request: web.Request) -> web.Response:
         arch = request.match_info['arch']
         label = request.match_info['label']
+        time_ctx = _resolve_time_ctx(request)
         pki_arch = _get_arch(architectures, arch)
         tsa = pki_arch.service_registry.summon_timestamper(
-            ServiceLabel(label), _resolve_time(request)
+            ServiceLabel(label), time_ctx.effective_time
         )
         data = await request.read()
         req: tsp.TimeStampReq = tsp.TimeStampReq.load(data)
@@ -112,8 +116,9 @@ def build_animator_app(
         use_pem = ext.endswith('.pem')
         pki_arch = _get_arch(architectures, arch)
         mime = 'application/x-pem-file' if use_pem else 'application/pkix-crl'
+        time_ctx = _resolve_time_ctx(request)
         crl = pki_arch.service_registry.get_crl(
-            ServiceLabel(label), _resolve_time(request)
+            ServiceLabel(label), time_ctx.effective_time
         )
         body = crl.dump()
         if use_pem:
@@ -257,9 +262,10 @@ def build_animator_app(
         except ConfigurationError:
             raise web.HTTPNotFound()
         content_type = plugin_info.content_type
+        time_ctx = _resolve_time_ctx(request)
         req_content = await request.read()
         response_bytes = services.invoke_plugin(
-            plugin_lbl, svc_lbl, req_content, at_time=_resolve_time(request)
+            plugin_lbl, svc_lbl, req_content, at_time=time_ctx.effective_time
         )
         return web.Response(body=response_bytes, content_type=content_type)
 
