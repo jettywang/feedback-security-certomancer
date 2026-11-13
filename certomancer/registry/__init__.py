@@ -23,6 +23,7 @@ from .plugin_api import (
     extension_plugin_registry,
     service_plugin_registry,
 )
+from .svc_config.crl import CRLRepoServiceInfo, CRLType, DeltaCRLConfig
 
 __all__ = [
     'CertomancerConfig',
@@ -44,6 +45,9 @@ __all__ = [
     'AttributePlugin',
     'CertProfilePlugin',
     'PluginServiceRequestError',
+    'CRLRepoServiceInfo',
+    'CRLType',
+    'DeltaCRLConfig',
     'extension_plugin_registry',
     'service_plugin_registry',
     'attr_plugin_registry',

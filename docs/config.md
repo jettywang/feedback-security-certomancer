@@ -946,6 +946,53 @@ settings are available.
 | `issuer-cert` |Cert label| Issuer's certificate. If the issuer only has one certificate, you don't need to bother with this setting. |
 | `simulated-update-schedule` | duration string | The (simulated) time between CRL updates. This should be specified as an ISO 8601-style duration string, e.g. `P30D` for a 30-day period. Month/year indicators are not allowed. This value affects the way CRL numbers are generated, and also how the `thisUpdate` / `nextUpdate` fields are populated. |
 | `crl-extensions` | list of dictionaries| Extra CRL extensions to use. These also follow the same format as certificate extensions.|
+| `delta-crl` | dictionary | Optional delta CRL settings. See below. |
+
+##### Delta CRLs
+
+A CRL repository can additionally publish delta CRLs by adding a `delta-crl`
+section. Full CRLs remain available at the usual `latest.crl` endpoint; delta
+CRLs are served at `delta-latest.crl` (and `delta-archive-<n>.crl` for their
+archives).
+
+```yaml
+services:
+  crl-repo:
+    interm:
+      for-issuer: interm
+      signing-key: interm
+      simulated-update-schedule: "P30D"
+      delta-crl:
+        base-crl-number: 253
+        issuance-period: "P10D"
+        distribution-point-name:
+          extra-urls: ["http://test.test/extra-delta.crl"]
+```
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `base-crl-number` | integer | CRL number of the base CRL that the delta CRL extends. This value is carried in the critical `deltaCRLIndicator` extension of every generated delta CRL. |
+| `issuance-period` | duration string | Time between consecutive delta CRL issuances. The first delta is issued at the first scheduled full CRL update after the base CRL. |
+| `distribution-point-name` | dictionary | Optional distribution point settings for the `freshestCRL` pointer that advertises the delta CRL. Uses the same format as the repository-level `distribution-point-name` setting. |
+| `crl-type` | string | Optional delta CRL scope. If specified, must match the repository's `crl-type`. |
+| `covered-reasons` | list | Optional delta CRL scope. If specified, must match the repository's `covered-reasons`. |
+| `crl-extensions` | list of dictionaries | Extra CRL extensions to add to delta CRLs. The CRL number, delta indicator, AKI, IDP and freshest-CRL extensions are managed automatically. |
+
+Delta CRLs only contain revocations that occurred strictly after the base
+CRL's `thisUpdate` (and no later than the delta's own `thisUpdate`).
+Certificate unrevocation (`removeFromCRL`) is not simulated; delta CRLs that
+would require it are rejected by the validation and merge helpers.
+
+The delta CRL's `issuingDistributionPoint` extension always matches the base
+CRL exactly, as required by RFC 5280, so its revocation scope cannot drift.
+Use the `freshestCRL` extension on the full CRL to discover the delta CRL URL.
+
+The service registry exposes `get_delta_crl` for generation, and
+`validate_delta_crl` / `merge_delta_crl` for strict offline-compatible
+validation and merging. Both signatures are verified against the issuer
+certificate before any merge. A merged CRL carries the delta CRL's CRL number
+and `thisUpdate` / `nextUpdate` values, since it represents the newer state,
+and the registry's merge result is re-signed with the repository key.
 
 
 #### OCSP responders  

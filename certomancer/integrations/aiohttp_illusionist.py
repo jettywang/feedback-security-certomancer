@@ -92,11 +92,13 @@ class AsyncIllusionist:
 
         return handle
 
-    def _make_crl_handler(self, label: ServiceLabel):
+    def _make_crl_handler(self, label: ServiceLabel, delta: bool = False):
         async def handle(
             request: aiohttp.web.Request,
         ) -> aiohttp.web.Response:
-            crl = self.pki_arch.service_registry.get_crl(label, self.at_time)
+            crl = self.pki_arch.service_registry.get_crl(
+                label, self.at_time, delta=delta
+            )
             return aiohttp.web.Response(
                 body=crl.dump(),
                 content_type='application/pkix-crl',
@@ -135,6 +137,12 @@ class AsyncIllusionist:
         for crl_repo in services.list_crl_repos():
             path = urlsplit(crl_repo.latest_external_url).path
             app.router.add_get(path, self._make_crl_handler(crl_repo.label))
+            if crl_repo.delta_crl is not None:
+                delta_path = urlsplit(crl_repo.delta_latest_external_url).path
+                app.router.add_get(
+                    delta_path,
+                    self._make_crl_handler(crl_repo.label, delta=True),
+                )
 
         for plugin_info in services.list_plugin_services():
             path = urlsplit(plugin_info.url).path

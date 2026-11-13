@@ -10,6 +10,7 @@ from .registry import (
     extension_plugin_registry,
     service_plugin_registry,
 )
+from .services import DeltaCRLError, merge_delta_crl
 
 __all__ = [
     'PKIArchitecture',
@@ -18,6 +19,8 @@ __all__ = [
     'ServicePlugin',
     'AttributePlugin',
     'CertProfilePlugin',
+    'DeltaCRLError',
+    'merge_delta_crl',
     'extension_plugin_registry',
     'service_plugin_registry',
     'attr_plugin_registry',

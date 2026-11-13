@@ -22,6 +22,7 @@ from ..crypto_utils import load_cert_from_pemder
 from ..services import (
     CertomancerServiceError,
     CRLBuilder,
+    DeltaCRLError,
     SimpleOCSPResponder,
     TimeStamper,
     choose_signed_digest,
@@ -1027,7 +1028,10 @@ class PKIArchitecture:
         return revo.to_crl_entry_asn1(serial, exts)
 
     def get_revoked_certs_at_time(
-        self, at_time: datetime, crl_info: CRLRepoServiceInfo
+        self,
+        at_time: datetime,
+        crl_info: CRLRepoServiceInfo,
+        since: Optional[datetime] = None,
     ):
         if crl_info.covered_reasons is not None:
             reason_strings = set(crl_info.covered_reasons.native)
@@ -1036,6 +1040,9 @@ class PKIArchitecture:
         labels = self._cert_labels_by_issuer[crl_info.for_issuer]
         for cert_label in labels:
             revo = self.check_revocation_status(cert_label, at_time=at_time)
+            if revo is not None and since is not None:
+                if revo.revoked_since <= since:
+                    revo = None
             cert = self.get_cert(cert_label)
             if revo is not None:
                 if reason_strings is None or (
@@ -1051,7 +1058,10 @@ class PKIArchitecture:
                     )
 
     def get_revoked_attr_certs_at_time(
-        self, at_time: datetime, crl_info: CRLRepoServiceInfo
+        self,
+        at_time: datetime,
+        crl_info: CRLRepoServiceInfo,
+        since: Optional[datetime] = None,
     ):
         if crl_info.covered_reasons is not None:
             reason_strings = set(crl_info.covered_reasons.native)
@@ -1062,6 +1072,9 @@ class PKIArchitecture:
             revo = self.check_revocation_status(
                 cert_label, at_time=at_time, is_ac=True
             )
+            if revo is not None and since is not None:
+                if revo.revoked_since <= since:
+                    revo = None
             cert = self.get_attr_cert(cert_label)
             if revo is not None:
                 if reason_strings is None or (
@@ -1284,27 +1297,97 @@ class ServiceRegistry:
             md_algorithm=info.digest_algo,
         )
 
+    def _crl_time_origin(self, crl_info: CRLRepoServiceInfo):
+        issuer_cert_label = crl_info.resolve_issuer_cert(self.pki_arch)
+        issuer_cert = self.pki_arch.get_cert(issuer_cert_label)
+        return issuer_cert.not_valid_before, issuer_cert
+
+    def _make_crl_builder(
+        self,
+        crl_info: CRLRepoServiceInfo,
+        *extra_extensions,
+    ):
+        signing_key_pair = self.pki_arch.key_set.get_asym_key(
+            crl_info.signing_key
+        )
+        signing_key = signing_key_pair.private
+        issuer_cert_label = crl_info.resolve_issuer_cert(self.pki_arch)
+        iss_cert = self.pki_arch.get_cert(issuer_cert_label)
+        extra_extensions = [
+            ext.to_asn1(self.pki_arch, crl.TBSCertListExtension)
+            for ext in crl_info.crl_extensions
+        ] + list(extra_extensions)
+        builder = CRLBuilder(
+            issuer_name=self.pki_arch.entities[
+                crl_info.crl_issuer or crl_info.for_issuer
+            ],
+            issuer_key=signing_key,
+            signature_algo=choose_signed_digest(
+                crl_info.digest_algo,
+                signing_key_pair.public,
+                signature_algo=crl_info.signature_algo,
+            ),
+            authority_key_identifier=iss_cert.key_identifier_value,
+            extra_crl_extensions=extra_extensions,
+        )
+        return builder, iss_cert
+
+    def _collect_revoked_certs(
+        self,
+        crl_info: CRLRepoServiceInfo,
+        at_time: datetime,
+        since: Optional[datetime] = None,
+    ):
+        revoked = []
+        if crl_info.crl_type != CRLType.AC_ONLY:
+            revoked.extend(
+                self.pki_arch.get_revoked_certs_at_time(
+                    at_time=at_time,
+                    crl_info=crl_info,
+                    since=since,
+                )
+            )
+        if crl_info.crl_type not in (CRLType.CA_ONLY, CRLType.USER_ONLY):
+            revoked.extend(
+                self.pki_arch.get_revoked_attr_certs_at_time(
+                    at_time=at_time,
+                    crl_info=crl_info,
+                    since=since,
+                )
+            )
+        return revoked
+
     def get_crl(
         self,
         repo_label: ServiceLabel,
         at_time: Optional[datetime] = None,
         number: Optional[int] = None,
+        delta: bool = False,
     ):
-        # TODO support delta CRLs
+        """
+        Generate a CRL from a CRL repository.
+
+        :param repo_label:
+            Label of the CRL repository.
+        :param at_time:
+            Point in time at which to evaluate revocation status. Ignored if
+            ``number`` is specified.
+        :param number:
+            Explicit CRL number. For delta CRLs, this refers to the delta CRL's
+            own number, not the base CRL number.
+        :param delta:
+            If ``True``, generate a delta CRL instead of a full CRL. The
+            repository must have delta CRL support enabled.
+        :return:
+            A :class:`asn1crypto.crl.CertificateList`.
+        """
+        if delta:
+            return self.get_delta_crl(
+                repo_label, at_time=at_time, number=number
+            )
+
         crl_info = self.get_crl_repo_info(repo_label)
-        issuer_cert_label = crl_info.issuer_cert
-        signing_key_pair = self.pki_arch.key_set.get_asym_key(
-            crl_info.signing_key
-        )
-        signing_key = signing_key_pair.private
-
-        # we need a cert to compute the right authority key identifier,
-        # time origin etc.
-        if issuer_cert_label is None:
-            issuer_cert_label = crl_info.resolve_issuer_cert(self.pki_arch)
-        iss_cert = self.pki_arch.get_cert(issuer_cert_label)
-
-        time_origin = iss_cert.not_valid_before
+        time_origin, iss_cert = self._crl_time_origin(crl_info)
         time_delta = crl_info.simulated_update_schedule
 
         if number is None:
@@ -1323,46 +1406,181 @@ class ServiceRegistry:
         this_update = time_origin + number * time_delta
         next_update = this_update + time_delta
 
-        extra_extensions = [
-            ext.to_asn1(self.pki_arch, crl.TBSCertListExtension)
-            for ext in crl_info.crl_extensions
-        ]
-        builder = CRLBuilder(
-            issuer_name=self.pki_arch.entities[
-                crl_info.crl_issuer or crl_info.for_issuer
-            ],
-            issuer_key=signing_key,
-            signature_algo=choose_signed_digest(
-                crl_info.digest_algo,
-                signing_key_pair.public,
-                signature_algo=crl_info.signature_algo,
-            ),
-            authority_key_identifier=iss_cert.key_identifier_value,
-            extra_crl_extensions=extra_extensions,
-        )
-
-        revoked = []
-        if crl_info.crl_type != CRLType.AC_ONLY:
-            revoked.extend(
-                self.pki_arch.get_revoked_certs_at_time(
-                    at_time=this_update,
-                    crl_info=crl_info,
-                )
-            )
-        if crl_info.crl_type not in (CRLType.CA_ONLY, CRLType.USER_ONLY):
-            revoked.extend(
-                self.pki_arch.get_revoked_attr_certs_at_time(
-                    at_time=this_update,
-                    crl_info=crl_info,
-                )
-            )
+        freshest_crl = None
+        if crl_info.delta_crl is not None:
+            freshest_crl = crl_info.format_freshest_crl(self.pki_arch.entities)
+        builder, _ = self._make_crl_builder(crl_info)
+        revoked = self._collect_revoked_certs(crl_info, at_time=this_update)
         return builder.build_crl(
             crl_number=number,
             this_update=this_update,
             next_update=next_update,
             revoked_certs=revoked,
             distpoint=crl_info.format_idp(self.pki_arch.entities),
+            freshest_crl=freshest_crl,
         )
+
+    def _delta_timeline(
+        self,
+        crl_info: CRLRepoServiceInfo,
+        at_time: Optional[datetime],
+        number: Optional[int],
+    ):
+        delta_cfg = crl_info.delta_crl
+        if delta_cfg is None:
+            raise CertomancerServiceError(
+                "Delta CRLs are not enabled for this CRL repository."
+            )
+        time_origin, iss_cert = self._crl_time_origin(crl_info)
+        full_period = crl_info.simulated_update_schedule
+        base_number = delta_cfg.base_crl_number
+        base_this_update = time_origin + base_number * full_period
+        first_delta_update = base_this_update + delta_cfg.issuance_period
+        first_delta_number = base_number + 1
+
+        if number is None:
+            if at_time is None:
+                at_time = datetime.now(tz=timezone.utc)
+            elapsed = at_time - first_delta_update
+            if elapsed < timedelta(0):
+                raise DeltaCRLError(
+                    "The requested time precedes the first delta CRL "
+                    "issuance after the configured base CRL."
+                )
+            delta_index = elapsed // delta_cfg.issuance_period
+            number = first_delta_number + delta_index
+        else:
+            delta_index = number - first_delta_number
+            if delta_index < 0:
+                raise DeltaCRLError(
+                    "Delta CRL number must be greater than the base CRL "
+                    "number."
+                )
+        this_update = (
+            first_delta_update + delta_index * delta_cfg.issuance_period
+        )
+        next_update = this_update + delta_cfg.issuance_period
+        return (
+            delta_cfg,
+            iss_cert,
+            base_this_update,
+            this_update,
+            next_update,
+            number,
+        )
+
+    def get_delta_crl(
+        self,
+        repo_label: ServiceLabel,
+        at_time: Optional[datetime] = None,
+        number: Optional[int] = None,
+    ):
+        """
+        Generate a delta CRL for a delta-enabled CRL repository.
+
+        The delta CRL contains only revocations that occurred strictly after
+        the base CRL's ``thisUpdate`` and no later than the delta CRL's own
+        ``thisUpdate``. Its ``deltaCRLIndicator`` is critical and carries the
+        configured base CRL number.
+        """
+        crl_info = self.get_crl_repo_info(repo_label)
+        (
+            delta_cfg,
+            _iss_cert,
+            base_this_update,
+            this_update,
+            next_update,
+            number,
+        ) = self._delta_timeline(crl_info, at_time, number)
+
+        delta_extensions = [
+            ext.to_asn1(self.pki_arch, crl.TBSCertListExtension)
+            for ext in delta_cfg.crl_extensions
+        ]
+        builder, _ = self._make_crl_builder(crl_info, *delta_extensions)
+        revoked = self._collect_revoked_certs(
+            crl_info, at_time=this_update, since=base_this_update
+        )
+        return builder.build_crl(
+            crl_number=number,
+            this_update=this_update,
+            next_update=next_update,
+            revoked_certs=revoked,
+            distpoint=crl_info.format_idp(self.pki_arch.entities, delta=True),
+            delta_crl_indicator=delta_cfg.base_crl_number,
+            freshest_crl=crl_info.format_freshest_crl(self.pki_arch.entities),
+        )
+
+    def _get_delta_repo_context(self, repo_label: ServiceLabel):
+        crl_info = self.get_crl_repo_info(repo_label)
+        delta_cfg = crl_info.delta_crl
+        if delta_cfg is None:
+            raise CertomancerServiceError(
+                "Delta CRLs are not enabled for this CRL repository."
+            )
+        issuer_cert = self.pki_arch.get_cert(
+            crl_info.resolve_issuer_cert(self.pki_arch)
+        )
+        return delta_cfg, issuer_cert
+
+    def validate_delta_crl(
+        self,
+        repo_label: ServiceLabel,
+        base_crl,
+        delta_crl,
+    ) -> int:
+        """
+        Validate a delta CRL against this repository's base CRL
+        configuration and its issuer certificate.
+
+        :return:
+            The delta CRL number.
+        :raises DeltaCRLError:
+            If the CRLs do not belong together or a signature is invalid.
+        """
+        delta_cfg, issuer_cert = self._get_delta_repo_context(repo_label)
+        return self._validate_delta_pair(
+            base_crl,
+            delta_crl,
+            issuer_cert,
+            expected_base_crl_number=delta_cfg.base_crl_number,
+        )
+
+    def merge_delta_crl(
+        self,
+        repo_label: ServiceLabel,
+        base_crl,
+        delta_crl,
+    ):
+        """
+        Validate and merge a delta CRL for this repository.
+
+        Both signatures are verified against the repository's issuer
+        certificate before the merge, and the merged CRL is signed with the
+        repository's configured signing key.
+        :return:
+            A signed, merged full CRL.
+        """
+        crl_info = self.get_crl_repo_info(repo_label)
+        delta_cfg, issuer_cert = self._get_delta_repo_context(repo_label)
+        merged_tbs = self._merge_delta_crl(
+            base_crl,
+            delta_crl,
+            issuer_cert,
+            expected_base_crl_number=delta_cfg.base_crl_number,
+        )
+        builder, _ = self._make_crl_builder(crl_info)
+        return builder.sign_crl(merged_tbs)
+
+    def _validate_delta_pair(self, *args, **kwargs):
+        from ..services import _validate_delta_pair
+
+        return _validate_delta_pair(*args, **kwargs)
+
+    def _merge_delta_crl(self, *args, **kwargs):
+        from ..services import merge_delta_crl
+
+        return merge_delta_crl(*args, **kwargs)
 
     def determine_repo_issuer_cert(self, repo_info: BaseCertRepoServiceInfo):
         # return the issuer's certificate

@@ -30,6 +30,15 @@ class CryptoBackend:
     ) -> algos.RSASSAPSSParams:
         raise NotImplementedError
 
+    def generic_verify(
+        self,
+        public_key: keys.PublicKeyInfo,
+        tbs_bytes: bytes,
+        signature: bytes,
+        sd_algo: algos.SignedDigestAlgorithm,
+    ) -> None:
+        raise NotImplementedError
+
 
 def _load_private_key_from_pemder_data(
     key_bytes: bytes, passphrase: Optional[bytes]
@@ -174,6 +183,71 @@ class PycaCryptographyBackend(CryptoBackend):
             }
         )
 
+    def generic_verify(
+        self,
+        public_key: keys.PublicKeyInfo,
+        tbs_bytes: bytes,
+        signature: bytes,
+        sd_algo: algos.SignedDigestAlgorithm,
+    ) -> None:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import (
+            dsa,
+            ec,
+            ed448,
+            ed25519,
+            padding,
+            rsa,
+        )
+
+        pub_key = serialization.load_der_public_key(public_key.dump())
+        sig_algo = sd_algo.signature_algo
+
+        try:
+            if sig_algo == 'rsassa_pkcs1v15':
+                hash_algo = getattr(hashes, sd_algo.hash_algo.upper())()
+                assert isinstance(pub_key, rsa.RSAPublicKey)
+                pub_key.verify(
+                    signature, tbs_bytes, padding.PKCS1v15(), hash_algo
+                )
+            elif sig_algo == 'rsassa_pss':
+                parameters = sd_algo['parameters']
+                mga: algos.MaskGenAlgorithm = parameters['mask_gen_algorithm']
+                if not mga['algorithm'].native == 'mgf1':
+                    raise NotImplementedError("Only MFG1 is supported")
+                mgf_md_name = mga['parameters']['algorithm'].native
+                salt_len: int = parameters['salt_length'].native
+                pss_padding = padding.PSS(
+                    mgf=padding.MGF1(
+                        algorithm=getattr(hashes, mgf_md_name.upper())()
+                    ),
+                    salt_length=salt_len,
+                )
+                hash_algo = getattr(hashes, sd_algo.hash_algo.upper())()
+                assert isinstance(pub_key, rsa.RSAPublicKey)
+                pub_key.verify(signature, tbs_bytes, pss_padding, hash_algo)
+            elif sig_algo == 'dsa':
+                hash_algo = getattr(hashes, sd_algo.hash_algo.upper())()
+                assert isinstance(pub_key, dsa.DSAPublicKey)
+                pub_key.verify(signature, tbs_bytes, hash_algo)
+            elif sig_algo == 'ecdsa':
+                hash_algo = getattr(hashes, sd_algo.hash_algo.upper())()
+                assert isinstance(pub_key, ec.EllipticCurvePublicKey)
+                pub_key.verify(signature, tbs_bytes, ec.ECDSA(hash_algo))
+            elif sig_algo == 'ed25519':
+                assert isinstance(pub_key, ed25519.Ed25519PublicKey)
+                pub_key.verify(signature, tbs_bytes)
+            elif sig_algo == 'ed448':
+                assert isinstance(pub_key, ed448.Ed448PublicKey)
+                pub_key.verify(signature, tbs_bytes)
+            else:  # pragma: nocover
+                raise NotImplementedError(
+                    f"The signature signature_algo {sig_algo} is unsupported"
+                )
+        except InvalidSignature as e:
+            raise ValueError("Invalid signature") from e
+
 
 CRYPTO_BACKEND: CryptoBackend = PycaCryptographyBackend()
 
@@ -200,6 +274,31 @@ def optimal_pss_params(
     key_algo: keys.PublicKeyInfo, digest_algo: str
 ) -> algos.RSASSAPSSParams:
     return CRYPTO_BACKEND.optimal_pss_params(key_algo, digest_algo)
+
+
+def generic_verify(
+    public_key: keys.PublicKeyInfo,
+    tbs_bytes: bytes,
+    signature: bytes,
+    signature_algo: algos.SignedDigestAlgorithm,
+):
+    """
+    Verify a signature using the configured crypto backend.
+
+    :param public_key:
+        Public key to verify against.
+    :param tbs_bytes:
+        Signed data.
+    :param signature:
+        Signature bytes.
+    :param signature_algo:
+        Signature algorithm to use.
+    :raises ValueError:
+        If the signature is invalid.
+    """
+    CRYPTO_BACKEND.generic_verify(
+        public_key, tbs_bytes, signature, signature_algo
+    )
 
 
 def load_certs_from_pemder(cert_files):

@@ -127,6 +127,7 @@ If not specified, data will be written to standard output.
 |`--ignore-tty` | none | Never try to prevent binary data from being written to stdout, even if stdout appears to be a tty. |
 |`--no-pem` | none | Do not PEM-armour the CRL, just output its raw DER encoding. |
 |`--at-time` | ISO 8601 datetime | Generate the latest CRL at the point in time specified (default: now) |
+|`--delta` | none | Generate a delta CRL instead of a full CRL. Requires `delta-crl` configuration on the repository. |
 
 Note: the `--at-time` flag takes the (simulated) publication schedule of the CRL into account.
 For example, if the `n`th CRL was published on `2021-01-01`, the next one is scheduled for

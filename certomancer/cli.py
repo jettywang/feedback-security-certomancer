@@ -318,6 +318,12 @@ def summon(
         'revocation status [default: now]'
     ),
 )
+@click.option(
+    '--delta',
+    type=bool,
+    is_flag=True,
+    help='generate a delta CRL instead of a full one',
+)
 @exception_manager()
 def necronomicon(
     ctx,
@@ -327,6 +333,7 @@ def necronomicon(
     no_pem: bool,
     at_time: Optional[str],
     ignore_tty: bool,
+    delta: bool,
 ):
     cfg: CertomancerConfig = next(ctx.obj['config'])
     pki_arch = cfg.get_pki_arch(ArchLabel(architecture))
@@ -335,7 +342,9 @@ def necronomicon(
     else:
         at_time_dt = parse_dt(at_time)
     crl = pki_arch.service_registry.get_crl(
-        repo_label=ServiceLabel(crl_repo), at_time=at_time_dt
+        repo_label=ServiceLabel(crl_repo),
+        at_time=at_time_dt,
+        delta=delta,
     )
 
     if output is None and no_pem and not ignore_tty and sys.stdout.isatty():

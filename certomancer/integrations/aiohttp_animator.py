@@ -120,6 +120,41 @@ def build_animator_app(
             body = pem.armor('X509 CRL', body)
         return web.Response(body=body, content_type=mime)
 
+    async def serve_crl_delta_latest(
+        request: web.Request,
+    ) -> web.Response:
+        arch = request.match_info['arch']
+        label = request.match_info['label']
+        ext = request.match_info['ext']
+        use_pem = ext.endswith('.pem')
+        pki_arch = _get_arch(architectures, arch)
+        mime = 'application/x-pem-file' if use_pem else 'application/pkix-crl'
+        crl = pki_arch.service_registry.get_crl(
+            ServiceLabel(label), _resolve_time(request), delta=True
+        )
+        body = crl.dump()
+        if use_pem:
+            body = pem.armor('X509 CRL', body)
+        return web.Response(body=body, content_type=mime)
+
+    async def serve_crl_delta_archive(
+        request: web.Request,
+    ) -> web.Response:
+        arch = request.match_info['arch']
+        label = request.match_info['label']
+        crl_no = int(request.match_info['crl_no'])
+        ext = request.match_info['ext']
+        use_pem = ext.endswith('.pem')
+        pki_arch = _get_arch(architectures, arch)
+        mime = 'application/x-pem-file' if use_pem else 'application/pkix-crl'
+        crl = pki_arch.service_registry.get_crl(
+            ServiceLabel(label), number=crl_no, delta=True
+        )
+        body = crl.dump()
+        if use_pem:
+            body = pem.armor('X509 CRL', body)
+        return web.Response(body=body, content_type=mime)
+
     async def serve_crl_archive(request: web.Request) -> web.Response:
         arch = request.match_info['arch']
         label = request.match_info['label']
@@ -359,6 +394,14 @@ def build_animator_app(
     router.add_get(
         r'/{arch}/crls/{label}/archive-{crl_no:\d+}.{ext:(crl|crl\.pem)}',
         serve_crl_archive,
+    )
+    router.add_get(
+        r'/{arch}/crls/{label}/delta-latest.{ext:(crl|crl\.pem)}',
+        serve_crl_delta_latest,
+    )
+    router.add_get(
+        r'/{arch}/crls/{label}/delta-archive-{crl_no:\d+}.{ext:(crl|crl\.pem)}',
+        serve_crl_delta_archive,
     )
     # Cert repo routes
     router.add_get(

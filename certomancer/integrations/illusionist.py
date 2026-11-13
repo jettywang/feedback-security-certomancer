@@ -53,6 +53,15 @@ class Illusionist:
                 content=partial(self.serve_crl, label=crl_repo.label),
                 headers={'Content-Type': 'application/pkix-crl'},
             )
+            if crl_repo.delta_crl is not None:
+                mocker.register_uri(
+                    'GET',
+                    crl_repo.delta_latest_external_url,
+                    content=partial(
+                        self.serve_crl, label=crl_repo.label, delta=True
+                    ),
+                    headers={'Content-Type': 'application/pkix-crl'},
+                )
 
         for plugin_info in services.list_plugin_services():
             mocker.register_uri(
@@ -88,8 +97,17 @@ class Illusionist:
         response = tsa.request_tsa_response(req)
         return response.dump()
 
-    def serve_crl(self, _request, _context, *, label: ServiceLabel):
-        crl = self.pki_arch.service_registry.get_crl(label, self.at_time)
+    def serve_crl(
+        self,
+        _request,
+        _context,
+        *,
+        label: ServiceLabel,
+        delta: bool = False,
+    ):
+        crl = self.pki_arch.service_registry.get_crl(
+            label, self.at_time, delta=delta
+        )
         return crl.dump()
 
     def serve_plugin(

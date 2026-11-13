@@ -3,16 +3,312 @@ import hashlib
 import os
 import struct
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from asn1crypto import algos, cms, core, crl, keys, ocsp, tsp, x509
 from asn1crypto.crl import TBSCertListExtension
 
-from certomancer.crypto_utils import generic_sign, optimal_pss_params
+from certomancer.crypto_utils import (
+    generic_sign,
+    generic_verify,
+    optimal_pss_params,
+)
 
 
 class CertomancerServiceError(Exception):
     pass
+
+
+class DeltaCRLError(CertomancerServiceError):
+    """
+    Raised when a delta CRL cannot be generated, validated or merged safely.
+
+    The error message is suitable for diagnostic output; callers should treat
+    it as an indication that the CRL data is inconsistent or untrustworthy.
+    """
+
+    pass
+
+
+def _crl_extension(crl_obj: crl.CertificateList, extn_id: str):
+    extensions = crl_obj['tbs_cert_list']['crl_extensions']
+    if not extensions:
+        return None
+    for ext in extensions:
+        if ext['extn_id'].native == extn_id:
+            return ext
+    return None
+
+
+def _crl_number(crl_obj: crl.CertificateList) -> int:
+    ext = _crl_extension(crl_obj, 'crl_number')
+    if ext is None:
+        raise DeltaCRLError("CRL does not carry a CRL number extension.")
+    return ext['extn_value'].native
+
+
+def _delta_crl_indicator(crl_obj: crl.CertificateList) -> Optional[int]:
+    ext = _crl_extension(crl_obj, 'delta_crl_indicator')
+    if ext is None:
+        return None
+    if not ext['critical'].native:
+        raise DeltaCRLError(
+            "The deltaCRLIndicator extension must be marked critical."
+        )
+    return ext['extn_value'].native
+
+
+def _issuing_distribution_point(crl_obj: crl.CertificateList):
+    ext = _crl_extension(crl_obj, 'issuing_distribution_point')
+    if ext is None:
+        return None
+    if not ext['critical'].native:
+        raise DeltaCRLError(
+            "The issuingDistributionPoint extension must be marked critical."
+        )
+    return ext['extn_value'].parsed
+
+
+def _authority_key_identifier(crl_obj: crl.CertificateList) -> Optional[bytes]:
+    ext = _crl_extension(crl_obj, 'authority_key_identifier')
+    if ext is None:
+        return None
+    return ext['extn_value'].native['key_identifier']
+
+
+def _idp_scope(idp) -> tuple:
+    if idp is None:
+        return ()
+    return (
+        idp['distribution_point'].dump() if idp['distribution_point'] else None,
+        bool(idp['only_contains_user_certs'].native),
+        bool(idp['only_contains_ca_certs'].native),
+        bool(idp['only_contains_attribute_certs'].native),
+        bool(idp['indirect_crl'].native),
+        idp['only_some_reasons'].native,
+    )
+
+
+def _check_crl_signature(
+    crl_obj: crl.CertificateList,
+    issuer_cert: x509.Certificate,
+):
+    tbs_sig_algo = crl_obj['tbs_cert_list']['signature']
+    sig_algo = crl_obj['signature_algorithm']
+    if tbs_sig_algo.native != sig_algo.native:
+        raise DeltaCRLError(
+            "The CRL signature algorithm does not match the TBS data."
+        )
+    try:
+        generic_verify(
+            issuer_cert.public_key,
+            crl_obj['tbs_cert_list'].dump(),
+            crl_obj['signature'].native,
+            sig_algo,
+        )
+    except (ValueError, NotImplementedError) as e:
+        raise DeltaCRLError(
+            "The CRL signature is invalid for the supplied issuer certificate."
+        ) from e
+
+
+def _validate_delta_pair(
+    base_crl: crl.CertificateList,
+    delta_crl: crl.CertificateList,
+    issuer_cert: Optional[x509.Certificate] = None,
+    *,
+    verify_signatures: bool = True,
+    expected_base_crl_number: Optional[int] = None,
+):
+    """
+    Check that a delta CRL can safely be applied to a base CRL.
+
+    This is the strict validation path used by :func:`merge_delta_crl` and the
+    service registry. It checks issuer, AKI, revocation scope, CRL numbers and
+    the delta indicator before any entries are merged.
+
+    :param base_crl:
+        The base (full) CRL.
+    :param delta_crl:
+        The delta CRL to validate.
+    :param issuer_cert:
+        Issuer certificate used to verify both signatures.
+    :param verify_signatures:
+        Whether to verify the cryptographic signatures. When ``True``,
+        ``issuer_cert`` is required.
+    :param expected_base_crl_number:
+        Optional expected base CRL number. If specified, the base CRL must
+        carry exactly that number.
+    :raises DeltaCRLError:
+        If the CRLs are inconsistent or a signature is invalid.
+    """
+    if verify_signatures:
+        if issuer_cert is None:
+            raise DeltaCRLError(
+                "An issuer certificate is required to verify CRL signatures."
+            )
+        _check_crl_signature(base_crl, issuer_cert)
+        _check_crl_signature(delta_crl, issuer_cert)
+
+    base_tbs = base_crl['tbs_cert_list']
+    delta_tbs = delta_crl['tbs_cert_list']
+
+    if base_tbs['issuer'].dump() != delta_tbs['issuer'].dump():
+        raise DeltaCRLError("Delta CRL issuer does not match the base CRL.")
+
+    base_aki = _authority_key_identifier(base_crl)
+    delta_aki = _authority_key_identifier(delta_crl)
+    if base_aki is not None or delta_aki is not None:
+        if base_aki != delta_aki:
+            raise DeltaCRLError(
+                "Delta CRL authority key identifier does not match the "
+                "base CRL."
+            )
+
+    if _idp_scope(_issuing_distribution_point(base_crl)) != _idp_scope(
+        _issuing_distribution_point(delta_crl)
+    ):
+        raise DeltaCRLError(
+            "Delta CRL issuing distribution point scope does not match "
+            "the base CRL."
+        )
+
+    base_number = _crl_number(base_crl)
+    delta_number = _crl_number(delta_crl)
+    delta_indicator = _delta_crl_indicator(delta_crl)
+    if delta_indicator is None:
+        raise DeltaCRLError(
+            "The supplied CRL is not a delta CRL (missing deltaCRLIndicator)."
+        )
+    if expected_base_crl_number is None:
+        expected_base_crl_number = base_number
+    if base_number != expected_base_crl_number:
+        raise DeltaCRLError(
+            f"Base CRL number {base_number} does not match expected base "
+            f"CRL number {expected_base_crl_number}."
+        )
+    if delta_indicator != base_number:
+        raise DeltaCRLError(
+            f"Delta CRL indicator {delta_indicator} does not match base CRL "
+            f"number {base_number}."
+        )
+    if delta_number <= base_number:
+        raise DeltaCRLError(
+            "Delta CRL number must be greater than the base CRL number."
+        )
+
+    base_this_update = base_tbs['this_update'].native
+    delta_this_update = delta_tbs['this_update'].native
+    if delta_this_update < base_this_update:
+        raise DeltaCRLError(
+            "Delta CRL thisUpdate precedes the base CRL thisUpdate."
+        )
+
+    return delta_number
+
+
+def merge_delta_crl(
+    base_crl: crl.CertificateList,
+    delta_crl: crl.CertificateList,
+    issuer_cert: Optional[x509.Certificate] = None,
+    *,
+    verify_signatures: bool = True,
+    expected_base_crl_number: Optional[int] = None,
+) -> crl.TbsCertList:
+    """
+    Merge a delta CRL into a base CRL, without signing the result.
+
+    The returned TBS structure reflects the state of the base CRL after all
+    new revocations in the delta have been applied. It carries the delta CRL's
+    CRL number and update timestamps, and no longer has a
+    ``deltaCRLIndicator``.
+
+    Callers that need a signed CRL can pass the returned TBS structure to
+    :meth:`CRLBuilder.sign_crl`, or use
+    :meth:`~certomancer.registry.pki_arch.ServiceRegistry.merge_delta_crl`,
+    which signs the merged result with the repository's configured key.
+
+    Revocation removals (``removeFromCRL`` entries) are rejected, since
+    Certomancer deliberately does not simulate certificate unrevocation.
+
+    :param base_crl:
+        The base (full) CRL.
+    :param delta_crl:
+        The delta CRL to apply.
+    :param issuer_cert:
+        Issuer certificate for signature verification. Required unless
+        ``verify_signatures`` is ``False``.
+    :param verify_signatures:
+        Whether to verify both CRL signatures before merging.
+    :param expected_base_crl_number:
+        Optional expected base CRL number.
+    :return:
+        The merged, unsigned :class:`asn1crypto.crl.TbsCertList`.
+    :raises DeltaCRLError:
+        If the CRLs are inconsistent, contain unsupported entries, or carry
+        invalid signatures.
+    """
+    _validate_delta_pair(
+        base_crl,
+        delta_crl,
+        issuer_cert,
+        verify_signatures=verify_signatures,
+        expected_base_crl_number=expected_base_crl_number,
+    )
+
+    base_tbs = base_crl['tbs_cert_list']
+    delta_tbs = delta_crl['tbs_cert_list']
+
+    merged_entries: Dict[int, crl.RevokedCertificate] = {}
+    for revo in base_tbs['revoked_certificates']:
+        merged_entries[revo['user_certificate'].native] = revo
+
+    base_this_update = base_tbs['this_update'].native
+    for revo in delta_tbs['revoked_certificates']:
+        if revo['revocation_date'].native < base_this_update:
+            raise DeltaCRLError(
+                "Delta CRL contains a revocation that predates the base CRL."
+            )
+        if any(
+            ext['extn_id'].native == 'crl_reason'
+            and ext['extn_value'].native == 'remove_from_crl'
+            for ext in revo['crl_entry_extensions']
+        ):
+            raise DeltaCRLError(
+                "Delta CRL contains a removeFromCRL entry, but revocation "
+                "removal is not supported."
+            )
+        serial = revo['user_certificate'].native
+        if serial in merged_entries:
+            raise DeltaCRLError(
+                f"Delta CRL re-revokes certificate serial {serial} already "
+                f"present in the base CRL."
+            )
+        merged_entries[serial] = revo
+
+    merged_tbs = base_tbs.copy()
+    merged_tbs['this_update'] = delta_tbs['this_update']
+    merged_tbs['next_update'] = delta_tbs['next_update']
+    merged_tbs['revoked_certificates'] = crl.RevokedCertificates(
+        list(merged_entries.values())
+    )
+
+    extensions = [
+        ext
+        for ext in merged_tbs['crl_extensions']
+        if ext['extn_id'].native not in ('delta_crl_indicator', 'crl_number')
+    ]
+    extensions.insert(
+        0,
+        crl.TBSCertListExtension(
+            {
+                'extn_id': 'crl_number',
+                'extn_value': core.Integer(_crl_number(delta_crl)),
+            }
+        ),
+    )
+    merged_tbs['crl_extensions'] = crl.TBSCertListExtensions(extensions)
+    return merged_tbs
 
 
 def get_nonce() -> int:
@@ -174,6 +470,8 @@ class CRLBuilder:
         next_update: datetime,
         revoked_certs,
         distpoint: Optional[dict] = None,
+        delta_crl_indicator: Optional[int] = None,
+        freshest_crl: Optional[x509.CRLDistributionPoints] = None,
     ) -> crl.CertificateList:
         tbs_crl = self.format_tbs_crl(
             crl_number=crl_number,
@@ -181,6 +479,8 @@ class CRLBuilder:
             revoked_certs=revoked_certs,
             next_update=next_update,
             distpoint=distpoint,
+            delta_crl_indicator=delta_crl_indicator,
+            freshest_crl=freshest_crl,
         )
         return self.sign_crl(tbs_crl)
 
@@ -226,6 +526,8 @@ class CRLBuilder:
         revoked_certs,
         next_update: datetime,
         distpoint: Optional[dict] = None,
+        delta_crl_indicator: Optional[int] = None,
+        freshest_crl: Optional[x509.CRLDistributionPoints] = None,
     ) -> crl.TbsCertList:
         extensions = [
             crl.TBSCertListExtension(
@@ -243,7 +545,26 @@ class CRLBuilder:
                 }
             ),
         ]
+        if delta_crl_indicator is not None:
+            extensions.append(
+                crl.TBSCertListExtension(
+                    {
+                        'extn_id': 'delta_crl_indicator',
+                        'critical': True,
+                        'extn_value': core.Integer(delta_crl_indicator),
+                    }
+                )
+            )
         extensions.extend(self.extra_crl_extensions)
+        if freshest_crl is not None:
+            extensions.append(
+                crl.TBSCertListExtension(
+                    {
+                        'extn_id': 'freshest_crl',
+                        'extn_value': freshest_crl,
+                    }
+                )
+            )
         if distpoint is not None:
             extn_value = crl.IssuingDistributionPoint(distpoint)
             extensions.append(

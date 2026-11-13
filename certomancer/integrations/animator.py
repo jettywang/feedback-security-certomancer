@@ -120,6 +120,21 @@ def service_rules():
             endpoint='crls',
             methods=('GET',),
         ),
+        # latest delta CRL pattern
+        Rule(
+            "/<arch>/crls/<label>/delta-latest.<ext(exts='crl'):use_pem>",
+            endpoint='crls',
+            methods=('GET',),
+            defaults={'crl_no': None, 'delta': True},
+        ),
+        # delta CRL archive pattern
+        Rule(
+            "/<arch>/crls/<label>"
+            "/delta-archive-<int:crl_no>.<ext(exts='crl'):use_pem>",
+            endpoint='crls',
+            methods=('GET',),
+            defaults={'delta': True},
+        ),
         # Cert repo authority pattern
         Rule(
             '/<arch>/certs/<label>/ca.<ext:use_pem>',
@@ -247,14 +262,17 @@ class Animator:
         arch: str,
         crl_no,
         use_pem,
+        delta: bool = False,
     ):
         pki_arch = self.architectures[ArchLabel(arch)]
         mime = 'application/x-pem-file' if use_pem else 'application/pkix-crl'
         if crl_no is not None:
-            crl = pki_arch.service_registry.get_crl(label, number=crl_no)
+            crl = pki_arch.service_registry.get_crl(
+                label, number=crl_no, delta=delta
+            )
         else:
             crl = pki_arch.service_registry.get_crl(
-                label, self.at_time(request)
+                label, self.at_time(request), delta=delta
             )
 
         data = crl.dump()
