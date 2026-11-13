@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zipfile import ZipFile
 
 import yaml
-from asn1crypto import cms, core, crl, ocsp, pem, x509
+from asn1crypto import cms, crl, ocsp, pem, x509
 
 from .._asn1_types import register_extensions
 from ..config_utils import (
@@ -38,8 +38,16 @@ from .common import (
     ServiceLabel,
 )
 from .entities import EntityRegistry, as_general_name
+from .ext_planning import (
+    ConfigExtensionProvenance,
+    ConfigSuppressionReason,
+    ExtensionConfigTrace,
+    ExtensionExplanation,
+    SuppressedConfigExtension,
+    plan_cert_extensions,
+)
 from .issued.attr_cert import AttributeCertificateSpec
-from .issued.cert import CertificateSpec
+from .issued.cert import EXTNS_EXCLUDED_FROM_TEMPLATE, CertificateSpec
 from .issued.general import IssuedItemSpec, RevocationStatus
 from .keys import KeySet, KeySets
 from .plugin_api import (
@@ -83,6 +91,9 @@ class _CertSpecConfigState(_IssuedItemConfigState):
         default_factory=lambda: defaultdict(list)
     )
     cert_specs: Dict[CertLabel, CertificateSpec] = field(default_factory=dict)
+    ext_trace: ExtensionConfigTrace = field(
+        default_factory=ExtensionConfigTrace
+    )
 
 
 def _config_issuer_serial(
@@ -126,11 +137,76 @@ def _combine_extension_cfgs(explicit_exts, template_exts, unique_req: bool):
     return extensions
 
 
+def _merge_template_extensions(
+    label: CertLabel,
+    template_label: CertLabel,
+    explicit_exts,
+    template_exts,
+    template_origins: List[ConfigExtensionProvenance],
+    unique_req: bool,
+):
+    """
+    Combine explicit extensions with those inherited from a template, keeping
+    provenance information for every entry that survives the merge, and
+    recording any entry that gets suppressed in unique mode.
+    """
+
+    own_provenance = ConfigExtensionProvenance(
+        declared_in=label, inherited=False
+    )
+    inherited_provenance = [
+        ConfigExtensionProvenance(
+            declared_in=origin.declared_in,
+            inherited=True,
+            template_chain=(template_label,) + origin.template_chain,
+        )
+        for origin in template_origins
+    ]
+
+    if not unique_req:
+        extensions = list(explicit_exts) + list(template_exts)
+        origins = (
+            [own_provenance] * len(explicit_exts)
+        ) + inherited_provenance
+        return extensions, origins, []
+
+    extensions = []
+    origins: List[ConfigExtensionProvenance] = []
+    suppressed: List[SuppressedConfigExtension] = []
+    seen = set()
+    candidates = (
+        list(zip(explicit_exts, [own_provenance] * len(explicit_exts)))
+        + list(zip(template_exts, inherited_provenance))
+    )
+    for ext_cfg, provenance in candidates:
+        try:
+            ext_id = ext_cfg['id']
+        except KeyError:
+            raise ConfigurationError(
+                "'id' is required in extension dictionaries"
+            )
+        if ext_id in seen:
+            suppressed.append(
+                SuppressedConfigExtension(
+                    raw_id=ext_id,
+                    reason=ConfigSuppressionReason.TEMPLATE_DUPLICATE,
+                    provenance=provenance,
+                )
+            )
+            continue
+        seen.add(ext_id)
+        extensions.append(ext_cfg)
+        origins.append(provenance)
+    return extensions, origins, suppressed
+
+
 def _process_template_config(
     cert_specs: Dict[CertLabel, CertificateSpec],
     name: str,
     cert_config: Dict[str, Any],
+    ext_trace: Optional[ExtensionConfigTrace] = None,
 ):
+    label = CertLabel(name)
     template = cert_config.pop('template', None)
     if template is not None:
         # we want to merge extensions from the template
@@ -142,18 +218,56 @@ def _process_template_config(
                 f"Cert spec '{name}' refers to '{template}' as a "
                 f"template, but '{template}' hasn't been declared yet."
             ) from e
+        template_label = CertLabel(template)
         effective_cert_config = dict(template_spec.templatable_config)
         template_extensions = effective_cert_config.get('extensions', [])
         effective_cert_config.update(cert_config)
 
-        # add new extensions
-        effective_cert_config['extensions'] = _combine_extension_cfgs(
-            extensions,
-            template_extensions,
-            effective_cert_config.get('unique_extensions', True),
+        # align provenance records with the template extensions that are
+        # still present in its templatable config (subject_alt_name and a
+        # few other entries are stripped when templates are derived)
+        template_trace = (
+            ext_trace.get_origins(template_label)
+            if ext_trace is not None
+            else []
         )
+        raw_template_exts = template_spec.templatable_config.get(
+            'extensions', []
+        )
+        aligned_trace = [
+            origin
+            for origin, ext_cfg in zip(template_trace, raw_template_exts)
+            if ext_cfg['id'] not in EXTNS_EXCLUDED_FROM_TEMPLATE
+        ]
+        if len(aligned_trace) != len(template_extensions):
+            aligned_trace = [
+                ConfigExtensionProvenance(
+                    declared_in=template_label,
+                    inherited=True,
+                    template_chain=(template_label,),
+                )
+            ] * len(template_extensions)
+
+        # add new extensions
+        merged_exts, ext_origins, ext_suppressed = _merge_template_extensions(
+            label=label,
+            template_label=template_label,
+            explicit_exts=extensions,
+            template_exts=template_extensions,
+            template_origins=aligned_trace,
+            unique_req=effective_cert_config.get('unique_extensions', True),
+        )
+        effective_cert_config['extensions'] = merged_exts
     else:
         effective_cert_config = dict(cert_config)
+        ext_origins = [
+            ConfigExtensionProvenance(declared_in=label, inherited=False)
+        ] * len(effective_cert_config.get('extensions', []))
+        ext_suppressed = []
+
+    if ext_trace is not None:
+        ext_trace.record_origins(label, ext_origins)
+        ext_trace.record_suppressed(label, ext_suppressed)
 
     # derive templatable config before setting defaults
     effective_cert_config['templatable_config'] = dict(
@@ -173,7 +287,10 @@ def _process_single_cert_spec(
     cert_config = key_dashes_to_underscores(cert_config)
 
     effective_cert_config = _process_template_config(
-        state.cert_specs, name.value, cert_config
+        state.cert_specs,
+        name.value,
+        cert_config,
+        ext_trace=state.ext_trace,
     )
 
     effective_cert_config['label'] = name.value
@@ -218,6 +335,7 @@ def _process_cert_spec_settings(
         state.cert_specs,
         state.cert_labels_by_issuer,
         state.cert_labels_by_subject,
+        state.ext_trace,
     )
 
 
@@ -469,6 +587,7 @@ class PKIArchitecture:
             self._cert_specs,
             cert_labels_by_issuer,
             cert_labels_by_subject,
+            self._ext_trace,
         ) = _process_cert_spec_settings(
             cert_spec_config, config_search_dir, cert_cache
         )
@@ -499,6 +618,59 @@ class PKIArchitecture:
             raise CertomancerObjectNotFoundError(
                 f"There is no registered certificate labelled '{label}'."
             ) from e
+
+    def peek_cached_cert(self, label: CertLabel):
+        """
+        Return a previously issued certificate from the cache without
+        triggering any signing, or ``None`` if the certificate has not been
+        built yet.
+        """
+        return self._cert_cache.get(label, None)
+
+    def get_extension_provenance(
+        self, label: CertLabel, position: int
+    ) -> 'ConfigExtensionProvenance':
+        """
+        Look up the config-time provenance of the ``position``-th entry in
+        the certificate spec's effective ``extensions`` list.
+        """
+        spec = self.get_cert_spec(label)
+        origins = self._ext_trace.get_origins(label)
+        try:
+            return origins[position]
+        except IndexError:
+            # fallback for specs that were registered programmatically
+            # without going through the template processing machinery
+            return ConfigExtensionProvenance(declared_in=label, inherited=False)
+
+    def get_suppressed_config_extensions(
+        self, label: CertLabel
+    ) -> List['SuppressedConfigExtension']:
+        """
+        Return extension entries that were dropped while merging templates
+        into the given certificate spec.
+        """
+        # make sure the label refers to a registered spec
+        self.get_cert_spec(label)
+        return self._ext_trace.get_suppressed(label)
+
+    def explain_cert_extensions(
+        self, label: CertLabel
+    ) -> ExtensionExplanation:
+        """
+        Explain how the extensions of the certificate identified by ``label``
+        would be selected when the certificate is issued, *without* issuing
+        it.
+
+        The explanation covers autogenerated SKI/AKI values, profile
+        extensions, explicit configuration and template inheritance, and
+        identifies overridden or suppressed extension entries together with
+        the reason why they did not make the final certificate. Calling this
+        method never signs a certificate and never populates the certificate
+        cache, so subsequent issuance results are unaffected.
+        """
+        spec = self.get_cert_spec(label)
+        return plan_cert_extensions(self, spec)
 
     def get_attr_cert_spec(self, label: CertLabel) -> AttributeCertificateSpec:
         try:
@@ -889,56 +1061,15 @@ class PKIArchitecture:
             digest_algo, authority_key.public_key_info, signature_algo
         )
 
-        # SKI and AKI are required by RFC 5280 in (almost) all certificates
-        # so we include them here
-        # TODO check for potential duplication?
-        ski = subject_key.public_key_info.sha1
-        ski_extension = x509.Extension(
-            {
-                'extn_id': 'key_identifier',
-                'critical': False,
-                'extn_value': core.OctetString(ski),
-            }
-        )
-        if spec.self_signed:
-            aki = ski
-        else:
-            try:
-                issuer_cert_lbl = spec.resolve_issuer_cert(self)
-                if issuer_cert_lbl == label:
-                    raise ConfigurationError(
-                        f"Self-reference detected: issuer cert for {label} "
-                        f"resolves to itself, but the certificate is not "
-                        f"self-signed: Authority key: {spec.authority_key}; "
-                        f"subject key: {spec.subject_key}."
-                    )
-                issuer_cert = self.get_cert(issuer_cert_lbl)
-                aki = issuer_cert.key_identifier_value
-            except CertomancerServiceError:
-                aki = None
-
-        if aki is None:
-            # use SHA-1 hash of issuer's public key as the default
-            # AKI value (which should be equivalent to the above, unless
-            # the user loaded in certificates that weren't generated
-            # by Certomancer)
-            aki = authority_key.public_key_info.sha1
-
-        aki_value = x509.AuthorityKeyIdentifier({'key_identifier': aki})
-        aki_extension = x509.Extension(
-            {
-                'extn_id': 'authority_key_identifier',
-                'critical': False,
-                'extn_value': aki_value,
-            }
-        )
-        extensions = self._collect_extensions(
-            spec,
-            {
-                'key_identifier': ski_extension,
-                'authority_key_identifier': aki_extension,
-            },
-        )
+        # Build the extension list through the same planner that powers
+        # explain_cert_extensions(), so issuance and explanation can never
+        # diverge. This includes the autogenerated SKI/AKI extensions, and
+        # (in unique mode) profile and config extensions.
+        explanation = plan_cert_extensions(self, spec)
+        extensions = [
+            x509.Extension.load(ext.extension_der)
+            for ext in explanation.extensions
+        ]
         tbs = x509.TbsCertificate(
             {
                 'version': 'v3',

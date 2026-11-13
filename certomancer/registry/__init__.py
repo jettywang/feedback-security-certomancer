@@ -8,6 +8,16 @@ from .common import (
     ServiceLabel,
 )
 from .config import CertomancerConfig
+from .ext_planning import (
+    ConfigExtensionProvenance,
+    ExplainedExtension,
+    ExtensionConfigTrace,
+    ExtensionExplanation,
+    ExtensionOrigin,
+    ExtensionSource,
+    SuppressedConfigExtension,
+    SuppressedExtension,
+)
 from .issued.attr_cert import AttributeCertificateSpec
 from .issued.cert import CertificateSpec
 from .keys import KeySet, KeySets
@@ -48,4 +58,12 @@ __all__ = [
     'service_plugin_registry',
     'attr_plugin_registry',
     'cert_profile_plugin_registry',
+    'ExtensionSource',
+    'ExtensionOrigin',
+    'ExtensionExplanation',
+    'ExplainedExtension',
+    'SuppressedExtension',
+    'ConfigExtensionProvenance',
+    'SuppressedConfigExtension',
+    'ExtensionConfigTrace',
 ]

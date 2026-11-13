@@ -2,7 +2,10 @@ from .registry import (
     AttributePlugin,
     CertomancerConfig,
     CertProfilePlugin,
+    ExtensionExplanation,
+    ExtensionOrigin,
     ExtensionPlugin,
+    ExtensionSource,
     PKIArchitecture,
     ServicePlugin,
     attr_plugin_registry,
@@ -22,4 +25,7 @@ __all__ = [
     'service_plugin_registry',
     'attr_plugin_registry',
     'cert_profile_plugin_registry',
+    'ExtensionSource',
+    'ExtensionOrigin',
+    'ExtensionExplanation',
 ]
