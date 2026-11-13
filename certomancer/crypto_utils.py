@@ -1,11 +1,126 @@
+import hashlib
 import logging
-from typing import Optional, Tuple
+import threading
+from collections import OrderedDict
+from typing import NamedTuple, Optional, Tuple
 
 from asn1crypto import algos, keys, pem, x509
 from asn1crypto.keys import PublicKeyInfo
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import (
+    dsa,
+    ec,
+    ed448,
+    ed25519,
+    rsa,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class PrivateKeyCacheStats(NamedTuple):
+    """Usage statistics for a :class:`PrivateKeyCache`."""
+
+    hits: int
+    misses: int
+    evictions: int
+    loads: int
+    size: int
+    capacity: int
+
+
+class PrivateKeyCache:
+    """
+    Bounded, content-addressed cache of deserialised pyca private keys.
+
+    Cache entries are keyed on a hash of the DER-encoded PKCS#8
+    :class:`asn1crypto.keys.PrivateKeyInfo`, never on a user-supplied label.
+    Two distinct keys with the same label therefore never collide, while the
+    same key material presented repeatedly (e.g. when batch-generating OCSP
+    responses, CRLs and certificates) is only parsed once.
+
+    The cache holds at most ``capacity`` entries: when it is full, the least
+    recently used key is evicted, so private key objects cannot accumulate
+    without bound. Set ``capacity`` to ``0`` to disable caching altogether.
+    """
+
+    def __init__(self, capacity: int = 16):
+        if capacity < 0:
+            raise ValueError("Private key cache capacity cannot be negative")
+        self._capacity = capacity
+        self._entries: 'OrderedDict[str, object]' = OrderedDict()
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+        self._loads = 0
+        self._lock = threading.RLock()
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    @property
+    def enabled(self) -> bool:
+        return self._capacity > 0
+
+    @staticmethod
+    def cache_key(private_key: keys.PrivateKeyInfo) -> str:
+        """Return the content-derived cache key for ``private_key``."""
+        return hashlib.sha256(private_key.dump()).hexdigest()
+
+    def get_or_load(
+        self,
+        private_key: keys.PrivateKeyInfo,
+        load_fn,
+    ):
+        """
+        Return the cached pyca private key for ``private_key``, parsing it
+        with ``load_fn`` on a cache miss.
+
+        ``load_fn`` receives the DER-encoded PKCS#8 bytes and must return the
+        deserialised pyca private key object.
+        """
+        if self._capacity == 0:
+            self._misses += 1
+            self._loads += 1
+            return load_fn(private_key.dump())
+
+        key_id = self.cache_key(private_key)
+        with self._lock:
+            try:
+                cached = self._entries.pop(key_id)
+            except KeyError:
+                self._misses += 1
+                self._loads += 1
+                loaded = load_fn(private_key.dump())
+                self._entries[key_id] = loaded
+                while len(self._entries) > self._capacity:
+                    self._entries.popitem(last=False)
+                    self._evictions += 1
+                return loaded
+            self._hits += 1
+            self._entries[key_id] = cached
+            return cached
+
+    def clear(self) -> None:
+        """Drop all cached private key objects and reset statistics."""
+        with self._lock:
+            self._entries.clear()
+            self._hits = 0
+            self._misses = 0
+            self._evictions = 0
+            self._loads = 0
+
+    def stats(self) -> PrivateKeyCacheStats:
+        with self._lock:
+            return PrivateKeyCacheStats(
+                hits=self._hits,
+                misses=self._misses,
+                evictions=self._evictions,
+                loads=self._loads,
+                size=len(self._entries),
+                capacity=self._capacity,
+            )
 
 
 class CryptoBackend:
@@ -51,16 +166,32 @@ def _load_private_key_from_pemder_data(
 
 
 class PycaCryptographyBackend(CryptoBackend):
+    def __init__(self, private_key_cache_size: int = 16):
+        # Bounded cache of deserialised pyca private keys, shared across all
+        # calls to load_private_key() and generic_sign(). The cache is keyed
+        # on the key material itself, so callers do not need to coordinate
+        # labels, and at most ``private_key_cache_size`` key objects are
+        # retained at any time.
+        self.private_key_cache = PrivateKeyCache(private_key_cache_size)
+
+    @staticmethod
+    def _deserialise_private_key(key_der: bytes):
+        return serialization.load_der_private_key(key_der, password=None)
+
+    def _get_private_key(self, private_key: keys.PrivateKeyInfo):
+        return self.private_key_cache.get_or_load(
+            private_key, self._deserialise_private_key
+        )
+
     def load_private_key(
         self, key_bytes: bytes, password: Optional[bytes]
     ) -> Tuple[keys.PrivateKeyInfo, keys.PublicKeyInfo]:
-        from cryptography.hazmat.primitives import serialization
-
         priv_key_info = _load_private_key_from_pemder_data(key_bytes, password)
         assert isinstance(priv_key_info, keys.PrivateKeyInfo)
-        key_bytes = priv_key_info.dump()
 
-        priv_key = serialization.load_der_private_key(key_bytes, password=None)
+        # Reuse the same deserialised object that generic_sign() will use
+        # later, so loading a key also warms the signing cache.
+        priv_key = self._get_private_key(priv_key_info)
         pub_key_bytes = priv_key.public_key().public_bytes(
             encoding=serialization.Encoding.DER,
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
@@ -79,67 +210,109 @@ class PycaCryptographyBackend(CryptoBackend):
         tbs_bytes: bytes,
         sd_algo: algos.SignedDigestAlgorithm,
     ) -> bytes:
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import (
-            dsa,
-            ec,
-            ed448,
-            ed25519,
-            padding,
-            rsa,
-        )
+        from cryptography.hazmat.primitives.asymmetric import padding
 
-        priv_key_bytes = private_key.dump()
+        # The cache lookup is the only DER parse; the returned object is
+        # reused across all requests that present the same key material.
+        priv_key = self._get_private_key(private_key)
 
-        priv_key = serialization.load_der_private_key(
-            priv_key_bytes, password=None
-        )
+        # Padding, digest and PSS parameters are constructed fresh from the
+        # algorithm object of *this* request on every call, so reusing the
+        # key object never leaks parameters between signatures.
         sig_algo = sd_algo.signature_algo
         if sig_algo == 'rsassa_pkcs1v15':
-            asym_padding = padding.PKCS1v15()
-            hash_algo = getattr(hashes, sd_algo.hash_algo.upper())()
-            assert isinstance(priv_key, rsa.RSAPrivateKey)
-            return priv_key.sign(tbs_bytes, asym_padding, hash_algo)
+            if not isinstance(priv_key, rsa.RSAPrivateKey):
+                raise TypeError(
+                    f"Signature algorithm {sig_algo} requires an RSA key, "
+                    f"got {type(priv_key).__name__}"
+                )
+            return priv_key.sign(
+                tbs_bytes,
+                padding.PKCS1v15(),
+                self._build_hash(sd_algo),
+            )
         elif sig_algo == 'rsassa_pss':
-            parameters = None
-            if parameters is None:
+            if not isinstance(priv_key, rsa.RSAPrivateKey):
+                raise TypeError(
+                    f"Signature algorithm {sig_algo} requires an RSA key, "
+                    f"got {type(priv_key).__name__}"
+                )
+            try:
                 parameters = sd_algo['parameters']
+                # asn1crypto represents absent CHOICE parameters as Void
+                if not isinstance(parameters, algos.RSASSAPSSParams):
+                    raise ValueError
+            except (KeyError, ValueError, TypeError):
+                raise ValueError(
+                    "rsassa_pss signatures require explicit PSS parameters"
+                )
 
             mga: algos.MaskGenAlgorithm = parameters['mask_gen_algorithm']
-            if not mga['algorithm'].native == 'mgf1':
-                raise NotImplementedError("Only MFG1 is supported")
+            if mga['algorithm'].native != 'mgf1':
+                raise NotImplementedError(
+                    f"Unsupported PSS mask generation algorithm "
+                    f"{mga['algorithm'].native}; only MGF1 is supported"
+                )
 
             mgf_md_name = mga['parameters']['algorithm'].native
-
             salt_len: int = parameters['salt_length'].native
-
-            mgf_md = getattr(hashes, mgf_md_name.upper())()
             pss_padding = padding.PSS(
-                mgf=padding.MGF1(algorithm=mgf_md), salt_length=salt_len
+                mgf=padding.MGF1(algorithm=self._build_hash_named(mgf_md_name)),
+                salt_length=salt_len,
             )
-            hash_algo = getattr(hashes, sd_algo.hash_algo.upper())()
-            assert isinstance(priv_key, rsa.RSAPrivateKey)
-            return priv_key.sign(tbs_bytes, pss_padding, hash_algo)
-        elif sig_algo == 'dsa':
-            assert isinstance(priv_key, dsa.DSAPrivateKey)
-            hash_algo = getattr(hashes, sd_algo.hash_algo.upper())()
-            return priv_key.sign(tbs_bytes, hash_algo)
-        elif sig_algo == 'ecdsa':
-            hash_algo = getattr(hashes, sd_algo.hash_algo.upper())()
-            assert isinstance(priv_key, ec.EllipticCurvePrivateKey)
             return priv_key.sign(
-                tbs_bytes, signature_algorithm=ec.ECDSA(hash_algo)
+                tbs_bytes, pss_padding, self._build_hash(sd_algo)
+            )
+        elif sig_algo == 'dsa':
+            if not isinstance(priv_key, dsa.DSAPrivateKey):
+                raise TypeError(
+                    f"Signature algorithm {sig_algo} requires a DSA key, "
+                    f"got {type(priv_key).__name__}"
+                )
+            return priv_key.sign(tbs_bytes, self._build_hash(sd_algo))
+        elif sig_algo == 'ecdsa':
+            if not isinstance(priv_key, ec.EllipticCurvePrivateKey):
+                raise TypeError(
+                    f"Signature algorithm {sig_algo} requires an EC key, "
+                    f"got {type(priv_key).__name__}"
+                )
+            return priv_key.sign(
+                tbs_bytes,
+                signature_algorithm=ec.ECDSA(self._build_hash(sd_algo)),
             )
         elif sig_algo == 'ed25519':
-            assert isinstance(priv_key, ed25519.Ed25519PrivateKey)
+            if not isinstance(priv_key, ed25519.Ed25519PrivateKey):
+                raise TypeError(
+                    f"Signature algorithm {sig_algo} requires an Ed25519 key, "
+                    f"got {type(priv_key).__name__}"
+                )
             return priv_key.sign(tbs_bytes)
         elif sig_algo == 'ed448':
-            assert isinstance(priv_key, ed448.Ed448PrivateKey)
+            if not isinstance(priv_key, ed448.Ed448PrivateKey):
+                raise TypeError(
+                    f"Signature algorithm {sig_algo} requires an Ed448 key, "
+                    f"got {type(priv_key).__name__}"
+                )
             return priv_key.sign(tbs_bytes)
-        else:  # pragma: nocover
+        else:
             raise NotImplementedError(
-                f"The signature signature_algo {sig_algo} is unsupported"
+                f"The signature algorithm {sig_algo} is unsupported"
             )
+
+    @staticmethod
+    def _build_hash_named(hash_algo: str):
+        from cryptography.hazmat.primitives import hashes
+
+        try:
+            hash_cls = getattr(hashes, hash_algo.upper())
+        except AttributeError as e:
+            raise ValueError(
+                f"Unsupported digest algorithm '{hash_algo}'"
+            ) from e
+        return hash_cls()
+
+    def _build_hash(self, sd_algo: algos.SignedDigestAlgorithm):
+        return self._build_hash_named(sd_algo.hash_algo)
 
     def optimal_pss_params(
         self, key: keys.PublicKeyInfo, digest_algo: str
