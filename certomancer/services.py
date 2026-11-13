@@ -15,6 +15,15 @@ class CertomancerServiceError(Exception):
     pass
 
 
+class CertomancerChainError(CertomancerServiceError):
+    """
+    Raised when a certificate chain cannot be built as requested, e.g.
+    because the configuration contains a signing cycle or because the
+    requested endpoint certificate is unreachable.
+    """
+    pass
+
+
 def get_nonce() -> int:
     """
     Generate a random 8-byte integer

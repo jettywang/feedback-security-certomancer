@@ -228,6 +228,16 @@ def mass_summon(
 )
 @click.option('--pfx-pass', type=str, help='set PFX file passphrase')
 @click.option(
+    '--chain-to',
+    type=str,
+    default=None,
+    help=(
+        'label of the certificate at which the embedded chain should end '
+        '(e.g. a specific root in a cross-signed setup); only used with '
+        '--as-pfx'
+    ),
+)
+@click.option(
     '--no-pem',
     help='use raw DER instead of PEM output',
     required=False,
@@ -245,6 +255,7 @@ def summon(
     as_pfx: bool,
     ignore_tty: bool,
     pfx_pass: str,
+    chain_to: Optional[str],
 ):
     cfg: CertomancerConfig = next(ctx.obj['config'])
     pki_arch = cfg.get_pki_arch(ArchLabel(architecture))
@@ -271,7 +282,9 @@ def summon(
         else:
             pfx_pass_bytes = None
         data = pki_arch.package_pkcs12(
-            CertLabel(cert_label), password=pfx_pass_bytes
+            CertLabel(cert_label),
+            password=pfx_pass_bytes,
+            chain_endpoint=CertLabel(chain_to) if chain_to else None,
         )
     else:
         if attr:

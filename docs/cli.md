@@ -76,9 +76,20 @@ The `summon` subcommand takes the following flags and options.
 |`--ignore-tty` | none | Never try to prevent binary data from being written to stdout, even if stdout appears to be a tty. |
 |`--as-pfx` | none | Output a PFX (PKCS #12) file that bundles the certificate with the corresponding chain of issuance and private key, if available. |
 |`--pfx-pass` | string | Set the passphrase for the PFX file. |
+|`--chain-to` | cert label | Only used with `--as-pfx`. Label of the certificate at which the embedded chain should end. Use this to pick a specific root when the issuing entity owns cross-signed certificates, instead of taking the first self-signed certificate encountered. |
 |`--no-pem` | none | Do not PEM-armour the certificate, just output its raw DER encoding. |
 
 Note: PKCS#12 support requires the `cryptography` library to be installed.
+
+By default, the chain embedded in a PFX file is built by following the issuer
+relation until the first self-signed certificate. Pass `--chain-to` to stop at
+an explicit endpoint certificate instead; this is useful when an intermediate
+CA is cross-signed by more than one root, since each choice produces a
+different chain. The same behaviour is available through the
+`PKIArchitecture.build_chain()` / `get_chain()` APIs (with the `endpoint`
+argument), the `get_possible_chains()` helper that enumerates all viable
+chains, and the `chain_endpoint` argument of `package_pkcs12()`. The Animator
+PFX download endpoints accept a `chain_to` form field with the same meaning.
 
 
 ## Generating many certificates

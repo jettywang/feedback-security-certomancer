@@ -2,7 +2,7 @@ import copy
 import itertools
 import os
 import os.path
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -20,6 +20,7 @@ from ..config_utils import (
 )
 from ..crypto_utils import load_cert_from_pemder
 from ..services import (
+    CertomancerChainError,
     CertomancerServiceError,
     CRLBuilder,
     SimpleOCSPResponder,
@@ -260,6 +261,11 @@ def _process_ac_spec_config(ac_spec_config):
 
 
 DEFAULT_FIRST_SERIAL = 0x1000
+
+
+def _as_cert_label(label) -> CertLabel:
+    # LabelString isn't a str subclass, so only wrap raw strings
+    return label if isinstance(label, CertLabel) else CertLabel(label)
 
 
 class PKIArchitecture:
@@ -593,15 +599,260 @@ class PKIArchitecture:
             if ac_spec.holder.name == holder_name:
                 yield ac_spec
 
-    def get_chain(self, cert_label: CertLabel) -> Iterable[CertLabel]:
-        # TODO support different chaining modes
-        #  (e.g. until a cert in a certain list of roots, or until a cert
-        #  owned by a particular entity)
-        cur_cert = self.get_cert_spec(cert_label)
-        while not cur_cert.self_signed:
-            next_cert_lbl = cur_cert.resolve_issuer_cert(self)
-            cur_cert = self.get_cert_spec(next_cert_lbl)
-            yield cur_cert.label
+    def build_chain(
+        self,
+        cert_label: CertLabel,
+        endpoint: Optional[CertLabel] = None,
+    ) -> List[CertLabel]:
+        """
+        Build the certificate chain above ``cert_label``, optionally stopping
+        at an explicit endpoint certificate.
+
+        The chain is found by searching the issuer relation defined by the
+        certificate specs. A certificate spec that does not name an explicit
+        ``issuer-cert`` may have more than one candidate issuer certificate
+        (this happens when an entity owns several certificates, e.g. after a
+        key rollover or under cross-signing); in that case all candidates are
+        explored. The resulting issuer graph is searched breadth-first, so the
+        shortest viable path is returned, in a deterministic order
+        (certificate labels are processed in configuration order).
+
+        The walk stops when:
+
+         * ``endpoint`` is reached (the endpoint itself is included in the
+           result); or
+         * a self-signed certificate is reached (when no explicit endpoint is
+           given).
+
+        Unlike a naive walk that stops at the first self-issued certificate,
+        this routine correctly handles self-issued certificates that are not
+        self-signed (e.g. CA key rollover), because such certificates merely
+        represent another hop in the chain. Configuration cycles are detected
+        and reported instead of causing an infinite loop.
+
+        :param cert_label:
+            The label of the certificate at which the chain starts
+            (this label itself is not included in the result).
+        :param endpoint:
+            Optional label of the certificate at which to stop. Use this to
+            select a specific root in a cross-signed setup, instead of relying
+            on the first self-signed certificate encountered.
+        :return:
+            A list of certificate labels making up the chain above
+            ``cert_label``, ordered from the immediate issuer up to and
+            including the endpoint (or the first self-signed certificate).
+        """
+        start = _as_cert_label(cert_label)
+        if endpoint is not None:
+            endpoint = _as_cert_label(endpoint)
+            # make sure the endpoint is a registered certificate spec
+            self.get_cert_spec(endpoint)
+            if endpoint == start:
+                # no hops are needed to reach oneself
+                return []
+
+        # breadth-first search over the issuer graph; BFS yields the shortest
+        # chain and explores issuer candidates in deterministic configuration
+        # order
+        queue = deque([(start, [])])
+        visited = {start}
+        while queue:
+            cur_label, path = queue.popleft()
+            cur_spec = self.get_cert_spec(cur_label)
+            if endpoint is None and cur_spec.self_signed:
+                return path
+            for next_label in self._resolve_issuer_certs(cur_spec):
+                next_path = path + [next_label]
+                if endpoint is not None and next_label == endpoint:
+                    return next_path
+                if next_label in visited:
+                    continue
+                visited.add(next_label)
+                queue.append((next_label, next_path))
+
+        if endpoint is not None:
+            raise CertomancerChainError(
+                f"Could not build a chain from '{cert_label}' to endpoint "
+                f"'{endpoint}': no valid issuer path connects them, or the "
+                f"issuer configuration contains a cycle."
+            )
+        raise CertomancerChainError(
+            f"Could not build a chain starting at '{cert_label}': the issuer "
+            f"relation does not lead to a self-signed certificate."
+        )
+
+    def get_chain(
+        self,
+        cert_label: CertLabel,
+        endpoint: Optional[CertLabel] = None,
+    ) -> Iterable[CertLabel]:
+        """
+        Yield the labels of the certificates making up the chain above
+        ``cert_label``, from the immediate issuer up to (and including) the
+        endpoint.
+
+        When ``endpoint`` is not supplied, the walk continues until the first
+        self-signed certificate. This mirrors the historical behaviour for
+        ordinary hierarchies without self-issued key rollover or
+        cross-signing; pass an explicit ``endpoint`` to disambiguate setups
+        with more than one viable chain.
+
+        :param cert_label:
+            The label of the certificate at which the chain starts.
+        :param endpoint:
+            Optional label of the certificate at which to stop.
+        """
+        yield from self.build_chain(cert_label, endpoint=endpoint)
+
+    def get_possible_chains(
+        self,
+        cert_label: CertLabel,
+        endpoints: Optional[Iterable[CertLabel]] = None,
+    ) -> List[List[CertLabel]]:
+        """
+        Enumerate the viable certificate chains above ``cert_label``.
+
+        Each returned chain is a list of labels ordered from the immediate
+        issuer up to (and including) its endpoint. A chain is produced for
+        every endpoint that is reachable from ``cert_label`` by following the
+        issuer relation. This makes the alternatives in a cross-signed
+        hierarchy explicit, and also exposes chains that end at non
+        self-signed trust anchors.
+
+        :param cert_label:
+            The label of the certificate at which the chains start.
+        :param endpoints:
+            Optional iterable of candidate endpoint labels. When omitted,
+            every reachable self-signed certificate is used as an endpoint.
+        :return:
+            A list of distinct chains, in the deterministic order in which
+            the endpoints and issuer candidates are declared in the
+            configuration.
+        """
+        start = _as_cert_label(cert_label)
+        if endpoints is None:
+            endpoints = self._find_reachable_self_signed(start)
+
+        chains = []
+        seen = set()
+        for endpoint in endpoints:
+            try:
+                chain = self.build_chain(
+                    start, endpoint=_as_cert_label(endpoint)
+                )
+            except CertomancerChainError:
+                continue
+            key = tuple(chain)
+            if key not in seen:
+                seen.add(key)
+                chains.append(chain)
+        return chains
+
+    def _find_reachable_self_signed(
+        self, cert_label: CertLabel
+    ) -> List[CertLabel]:
+        reachable: List[CertLabel] = []
+        visited: set = set()
+        stack = [_as_cert_label(cert_label)]
+        while stack:
+            cur_label = stack.pop()
+            if cur_label in visited:
+                continue
+            visited.add(cur_label)
+            cur_spec = self.get_cert_spec(cur_label)
+            if cur_spec.self_signed:
+                if cur_label not in reachable:
+                    reachable.append(cur_label)
+                continue
+            for issuer_label in self._resolve_issuer_certs(cur_spec):
+                if issuer_label not in visited:
+                    stack.append(issuer_label)
+        return reachable
+
+    def check_chain_cycles(self) -> None:
+        """
+        Validate that the issuer graph of the architecture does not contain
+        any cycles.
+
+        A self-edge is a legitimate terminal relationship and is not
+        reported as a cycle: this covers self-signed roots as well as
+        self-issued certificates that appear when an entity owns several
+        certificates (e.g. during a key rollover), since an entity-based
+        issuer lookup lists all of an entity's certificates, including the
+        certificate currently being examined.
+
+        :raises CertomancerChainError:
+            if a non-trivial cycle is detected.
+        """
+        # iterative DFS with three-colour marking over the issuer graph,
+        # ignoring legitimate self-edges
+        state: Dict[CertLabel, int] = defaultdict(int)
+        for root_label in self._cert_specs:
+            if state[root_label] != 0:
+                continue
+            stack = [(
+                root_label,
+                iter(
+                    lbl
+                    for lbl in self._resolve_issuer_certs(
+                        self.get_cert_spec(root_label)
+                    )
+                    if lbl != root_label
+                ),
+            )]
+            state[root_label] = 1
+            while stack:
+                node, children = stack[-1]
+                advanced = False
+                for child in children:
+                    if state[child] == 1:
+                        raise CertomancerChainError(
+                            f"The issuer configuration contains a cycle "
+                            f"involving certificate '{child}'."
+                        )
+                    if state[child] == 0:
+                        state[child] = 1
+                        stack.append((
+                            child,
+                            iter(
+                                lbl
+                                for lbl in self._resolve_issuer_certs(
+                                    self.get_cert_spec(child)
+                                )
+                                if lbl != child
+                            ),
+                        ))
+                        advanced = True
+                        break
+                if not advanced:
+                    state[node] = 2
+                    stack.pop()
+
+    def _resolve_issuer_certs(
+        self, spec: CertificateSpec
+    ) -> List[CertLabel]:
+        # Chain discovery is entity-based: every certificate owned by the
+        # issuer entity is a potential predecessor in some valid chain, even
+        # when this particular spec named a concrete ``issuer_cert`` (that
+        # pin only constrains how the certificate is issued, e.g. which key
+        # signs it and which AKI it carries). This is what makes cross-signed
+        # certificates discoverable as alternative chain paths.
+        candidates = [
+            _as_cert_label(lbl)
+            for lbl in self.get_cert_labels_for_entity(spec.issuer)
+        ]
+        if not candidates:
+            # fall back to the explicit pin if the issuer entity has no
+            # registered subject certificates (e.g. external setups)
+            if spec.issuer_cert is not None:
+                candidates = [_as_cert_label(spec.issuer_cert)]
+            else:
+                raise CertomancerChainError(
+                    f"Certificate '{spec.label}' refers to issuer entity "
+                    f"'{spec.issuer}', which does not own any registered "
+                    f"certificate."
+                )
+        return candidates
 
     def package_pkcs12(
         self,
@@ -609,6 +860,7 @@ class PKIArchitecture:
         key_label: Optional[KeyLabel] = None,
         certs_to_embed: Optional[Iterable[CertLabel]] = None,
         password: Optional[bytes] = None,
+        chain_endpoint: Optional[CertLabel] = None,
     ):
         try:
             from cryptography import x509 as pyca_x509
@@ -635,7 +887,14 @@ class PKIArchitecture:
         if key_label is None:
             key_label = cert_spec.subject_key
         if certs_to_embed is None:
-            certs_to_embed = list(self.get_chain(cert_label))
+            certs_to_embed = list(
+                self.get_chain(cert_label, endpoint=chain_endpoint)
+            )
+        elif chain_endpoint is not None:
+            raise CertomancerServiceError(
+                "The 'chain_endpoint' parameter cannot be combined with an "
+                "explicit 'certs_to_embed' argument."
+            )
         # We need to convert between asn1crypto objects and pyca/cryptography
         # objects here.
         key_der = self.key_set.get_private_key(key_label).dump()

@@ -446,7 +446,13 @@ class Animator:
             raise NotFound()
 
         pass_bytes = request.form.get('passphrase', '').encode('utf8')
-        data = pki_arch.package_pkcs12(cert_label, password=pass_bytes or None)
+        raw_endpoint = request.form.get('chain_to')
+        chain_endpoint = CertLabel(raw_endpoint) if raw_endpoint else None
+        data = pki_arch.package_pkcs12(
+            cert_label,
+            password=pass_bytes or None,
+            chain_endpoint=chain_endpoint,
+        )
         cd_header = f'attachment; filename="{cert_label}.pfx"'
         return Response(
             data,

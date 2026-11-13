@@ -334,7 +334,13 @@ def build_animator_app(
         raw_pass = post_data.get('passphrase', '')
         pass_str = raw_pass if isinstance(raw_pass, str) else ''
         pass_bytes = pass_str.encode('utf8') if pass_str else None
-        body = pki_arch.package_pkcs12(cert_label, password=pass_bytes)
+        raw_endpoint = post_data.get('chain_to')
+        chain_endpoint = CertLabel(raw_endpoint) if raw_endpoint else None
+        body = pki_arch.package_pkcs12(
+            cert_label,
+            password=pass_bytes,
+            chain_endpoint=chain_endpoint,
+        )
         cd_header = f'attachment; filename="{cert_label}.pfx"'
         return web.Response(
             body=body,
