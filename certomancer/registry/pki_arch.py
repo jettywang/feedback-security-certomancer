@@ -3,7 +3,7 @@ import itertools
 import os
 import os.path
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zipfile import ZipFile
@@ -40,7 +40,7 @@ from .common import (
 from .entities import EntityRegistry, as_general_name
 from .issued.attr_cert import AttributeCertificateSpec
 from .issued.cert import CertificateSpec
-from .issued.general import IssuedItemSpec, RevocationStatus
+from .issued.general import IssuedItemSpec, RevocationStatus, TimeRef, Validity
 from .keys import KeySet, KeySets
 from .plugin_api import (
     AttributePluginRegistry,
@@ -262,6 +262,108 @@ def _process_ac_spec_config(ac_spec_config):
 DEFAULT_FIRST_SERIAL = 0x1000
 
 
+def _resolve_validity_refs(
+    cert_specs: Dict[CertLabel, CertificateSpec],
+    ac_specs: Dict[CertLabel, AttributeCertificateSpec],
+):
+    """
+    Resolve validity references (see :class:`TimeRef`) in all certificate
+    and attribute certificate specs to absolute timestamps.
+
+    This runs after template inheritance has been applied to all specs,
+    so the result does not depend on the order in which certificates were
+    declared in the configuration.
+    """
+    resolved_validity: Dict[CertLabel, Validity] = {}
+    resolution_stack: List[CertLabel] = []
+
+    def _resolve_cert_validity(label: CertLabel) -> Validity:
+        try:
+            return resolved_validity[label]
+        except KeyError:
+            pass
+        spec = cert_specs[label]
+        if label in resolution_stack:
+            cycle = ' -> '.join(str(lbl) for lbl in [*resolution_stack, label])
+            raise ConfigurationError(
+                f"Circular validity reference detected: {cycle}."
+            )
+        resolution_stack.append(label)
+        valid_from = _resolve_endpoint(
+            spec, spec.validity.valid_from, 'valid-from'
+        )
+        valid_to = _resolve_endpoint(spec, spec.validity.valid_to, 'valid-to')
+        resolution_stack.pop()
+        validity = _mk_checked_validity(label, valid_from, valid_to)
+        resolved_validity[label] = validity
+        return validity
+
+    def _resolve_endpoint(owner_spec: IssuedItemSpec, endpoint, key: str):
+        if isinstance(endpoint, datetime):
+            return endpoint
+        if not isinstance(endpoint, TimeRef):  # pragma: nocover
+            raise ConfigurationError(
+                f"Invalid validity endpoint in '{key}' of certificate "
+                f"'{owner_spec.label}': {endpoint!r}."
+            )
+        owner_lbl = owner_spec.label
+        if endpoint.cert == owner_lbl:
+            raise ConfigurationError(
+                f"Validity reference in '{key}' of certificate '{owner_lbl}' "
+                f"points to the certificate itself."
+            )
+        try:
+            target_spec = cert_specs[endpoint.cert]
+        except KeyError as e:
+            raise ConfigurationError(
+                f"Validity reference in '{key}' of certificate '{owner_lbl}' "
+                f"points to unknown certificate '{endpoint.cert}'."
+            ) from e
+        if (
+            isinstance(owner_spec, CertificateSpec)
+            and target_spec.subject == owner_spec.subject
+        ):
+            raise ConfigurationError(
+                f"Validity reference in '{key}' of certificate '{owner_lbl}' "
+                f"points to certificate '{endpoint.cert}', which is issued "
+                f"to the same subject '{owner_spec.subject}'. Anchoring "
+                f"validity periods to rotation certificates of the same "
+                f"subject is not allowed; anchor to a certificate of the "
+                f"issuing CA instead."
+            )
+        target_validity = _resolve_cert_validity(endpoint.cert)
+        if endpoint.endpoint == 'not_before':
+            base = target_validity.valid_from
+        else:
+            base = target_validity.valid_to
+        return base + endpoint.offset
+
+    def _mk_checked_validity(owner_lbl, valid_from, valid_to) -> Validity:
+        if valid_from >= valid_to:
+            raise ConfigurationError(
+                f"Validity period of certificate '{owner_lbl}' is inverted: "
+                f"valid-from ({valid_from.isoformat()}) must be strictly "
+                f"before valid-to ({valid_to.isoformat()})."
+            )
+        return Validity(valid_from=valid_from, valid_to=valid_to)
+
+    for label in list(cert_specs.keys()):
+        validity = _resolve_cert_validity(label)
+        spec = cert_specs[label]
+        if spec.validity is not validity:
+            cert_specs[label] = replace(spec, validity=validity)
+
+    for label, spec in list(ac_specs.items()):
+        validity = spec.validity
+        if validity.resolved:
+            continue
+        valid_from = _resolve_endpoint(spec, validity.valid_from, 'valid-from')
+        valid_to = _resolve_endpoint(spec, validity.valid_to, 'valid-to')
+        ac_specs[label] = replace(
+            spec, validity=_mk_checked_validity(label, valid_from, valid_to)
+        )
+
+
 class PKIArchitecture:
     """
     A collection of entities, keys, certificates and trust services, as
@@ -289,6 +391,7 @@ class PKIArchitecture:
         config_search_dir: Optional[SearchDir] = None,
         cert_cache=None,
         ac_cache=None,
+        strict_validity: bool = False,
     ) -> 'PKIArchitecture':
         check_config_keys(arch_label, PKIArchitecture.CONFIG_KEYS, cfg)
         key_set_label = cfg.get('keyset', arch_label)
@@ -332,6 +435,7 @@ class PKIArchitecture:
             ac_spec_config=ac_specs,
             cert_cache=cert_cache,
             ac_cache=ac_cache,
+            strict_validity=strict_validity,
         )
 
     @classmethod
@@ -343,6 +447,7 @@ class PKIArchitecture:
         config_search_dir: Optional[SearchDir],
         extension_plugins: Optional[ExtensionPluginRegistry] = None,
         service_plugins: Optional['ServicePluginRegistry'] = None,
+        strict_validity: bool = False,
     ):
         arch_specs: Dict[ArchLabel, Dict[str, Any]] = {}
         for lbl, cfg in cfgs.items():
@@ -419,6 +524,7 @@ class PKIArchitecture:
                 extension_plugins=extension_plugins,
                 config_search_dir=config_search_dir,
                 service_plugins=service_plugins,
+                strict_validity=strict_validity,
             )
 
     def __init__(
@@ -437,6 +543,7 @@ class PKIArchitecture:
         config_search_dir: Optional[SearchDir] = None,
         cert_cache=None,
         ac_cache=None,
+        strict_validity: bool = False,
     ):
         self.arch_label = arch_label
         self.key_set = key_set
@@ -477,6 +584,10 @@ class PKIArchitecture:
             ac_labels_by_issuer,
             ac_labels_by_holder,
         ) = _process_ac_spec_config(ac_spec_config or {})
+        # Resolve validity references now that all specs (including
+        # template-inherited settings) have been parsed; the result is
+        # independent of declaration order.
+        _resolve_validity_refs(self._cert_specs, self._ac_specs)
         self._cert_labels_by_issuer: Dict[EntityLabel, List[CertLabel]] = (
             cert_labels_by_issuer
         )
@@ -491,6 +602,8 @@ class PKIArchitecture:
         )
         self._cert_cache = cert_cache
         self._ac_cache = ac_cache
+        if strict_validity:
+            self._check_issuer_validity_windows()
 
     def get_cert_spec(self, label: CertLabel) -> CertificateSpec:
         try:
@@ -499,6 +612,45 @@ class PKIArchitecture:
             raise CertomancerObjectNotFoundError(
                 f"There is no registered certificate labelled '{label}'."
             ) from e
+
+    def _check_issuer_validity_windows(self):
+        """
+        Verify that every certificate's validity window fits inside the
+        validity window of its issuer's certificate, and raise a
+        :class:`ConfigurationError` explaining the problem if not.
+        """
+        for label, spec in self._cert_specs.items():
+            if spec.self_signed:
+                continue
+            try:
+                issuer_cert_lbl = spec.resolve_issuer_cert(self)
+            except CertomancerServiceError as e:
+                raise ConfigurationError(
+                    f"Could not determine the issuer certificate for "
+                    f"'{label}' while checking validity windows: {e}"
+                ) from e
+            issuer_validity = self._cert_specs[issuer_cert_lbl].validity
+            validity = spec.validity
+            problems = []
+            if validity.valid_from < issuer_validity.valid_from:
+                problems.append(
+                    f"valid-from ({validity.valid_from.isoformat()}) precedes "
+                    f"the issuer's valid-from "
+                    f"({issuer_validity.valid_from.isoformat()})"
+                )
+            if validity.valid_to > issuer_validity.valid_to:
+                problems.append(
+                    f"valid-to ({validity.valid_to.isoformat()}) is later "
+                    f"than the issuer's valid-to "
+                    f"({issuer_validity.valid_to.isoformat()})"
+                )
+            if problems:
+                raise ConfigurationError(
+                    f"Validity window of certificate '{label}' exceeds that "
+                    f"of its issuer certificate '{issuer_cert_lbl}': "
+                    + '; '.join(problems)
+                    + "."
+                )
 
     def get_attr_cert_spec(self, label: CertLabel) -> AttributeCertificateSpec:
         try:

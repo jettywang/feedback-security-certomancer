@@ -52,6 +52,7 @@ class CertomancerConfig:
         key_search_dir,
         config_search_dir=None,
         external_url_prefix=None,
+        strict_validity=False,
     ) -> 'CertomancerConfig':
         config_dict = yaml.safe_load(yaml_str)
         return CertomancerConfig(
@@ -59,6 +60,7 @@ class CertomancerConfig:
             key_search_dir=key_search_dir,
             config_search_dir=config_search_dir,
             external_url_prefix=external_url_prefix,
+            strict_validity=strict_validity,
         )
 
     @classmethod
@@ -69,6 +71,7 @@ class CertomancerConfig:
         config_search_dir=None,
         allow_external_config=True,
         external_url_prefix=None,
+        strict_validity=False,
     ) -> 'CertomancerConfig':
         main_config_dir = os.path.dirname(cfg_path)
         if not allow_external_config:
@@ -83,6 +86,7 @@ class CertomancerConfig:
             key_search_dir=key_search_dir,
             config_search_dir=config_search_dir,
             external_url_prefix=external_url_prefix,
+            strict_validity=strict_validity,
         )
 
     def __init__(
@@ -92,6 +96,7 @@ class CertomancerConfig:
         lazy_load_keys=False,
         config_search_dir: Optional[str] = None,
         external_url_prefix=None,
+        strict_validity=False,
     ):
         if external_url_prefix is None:
             self.external_url_prefix = external_url_prefix = config.get(
@@ -132,6 +137,7 @@ class CertomancerConfig:
                 arch_cfgs,
                 external_url_prefix=external_url_prefix,
                 config_search_dir=search_dir,
+                strict_validity=strict_validity,
             )
         }
 

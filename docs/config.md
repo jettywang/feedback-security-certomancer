@@ -248,10 +248,57 @@ Here is an overview of the keys that set basic certificate properties and their 
 | `subject-key` |Key label| The key label used to determine the subject's public key for the purposes of the current certificate. Defaults to the value of `subject` if unspecified. Note that this default only makes sense if there exists a key with the same label as the value of `subject`, since entities are not a priori bound to keys in Certomancer.|
 | `issuer` |Entity label| The label of the entity issuing the certificate.|
 | `authority-key` |Key label| The label of the key that will be used to sign the certificate. Defaults to the value of `issuer`; the same caveats as those for `subject-key` also apply here.|
-| `validity` |dictionary| Takes a dictionary with two keys, `valid-from` and `valid-to`. The values of these should be timestamps specified in ISO 8601 format (including UTC offset).|
+| `validity` |dictionary| Takes a dictionary with two keys, `valid-from` and `valid-to`. The values of these should be timestamps specified in ISO 8601 format (including UTC offset), or references to another certificate's validity endpoints (see [Validity references](#validity-references)).|
 | `serial` |integer| You can manually specify the certificate's serial number if you want. If unspecified, Certomancer will populate this field automatically, making sure that all certificates issued by a given issuer have distinct serial numbers.|
 | `issuer-cert` |Cert label| You can optionally specify the "preferred" issuer's certificate to use when required by Certomancer's trust services. In principle, this isn't relevant for the certificate signing process itself, but having a preferred issuer certificate lying around is sometimes convenient for a variety of reasons. If the issuing entity has exactly one certificate issued to it, you don't need to worry about this setting.|
 
+
+#### Validity references
+
+Instead of an absolute timestamp, either validity endpoint can be anchored
+to an explicitly named endpoint of another certificate, plus an optional
+offset. This is particularly useful when maintaining test PKIs with
+rotating certificates: moving a single "anchor" date (e.g. the CA's
+`valid-from`) automatically shifts all derived validity windows.
+
+```yaml
+validity:
+   valid-from:
+      cert: root           # label of the certificate to anchor to
+      endpoint: not-before # or not-after
+      offset: P1D          # optional ISO 8601 duration; prefix with '-'
+                           # to shift backwards
+   valid-to:
+      cert: root
+      endpoint: not-after
+      offset: -P1D
+```
+
+References are resolved after template inheritance has been applied to all
+certificate definitions, so the result does not depend on the order in
+which certificates are declared. Absolute timestamps and references can be
+mixed freely within one `validity` dictionary.
+
+Certomancer reports a configuration error (naming the certificate
+involved) in the following situations:
+
+ - a reference points to an unknown certificate, to the certificate
+   itself, or forms a cycle;
+ - a reference points to another certificate issued to the *same subject*
+   (e.g. a rotation sibling) — anchor to a CA certificate instead;
+ - an absolute timestamp lacks a timezone/UTC offset;
+ - the resolved `valid-from` is not strictly before `valid-to`.
+
+By default, Certomancer uses the configured validity windows as-is and
+never silently clips dates, even if a certificate's window exceeds that of
+its issuer. Callers that want this treated as an error can opt into strict
+checking, which reports which endpoint exceeds the issuer's window:
+
+```python
+from certomancer import CertomancerConfig
+
+cfg = CertomancerConfig.from_file('my-config.yml', strict_validity=True)
+```
 
 #### Certificate extensions
 

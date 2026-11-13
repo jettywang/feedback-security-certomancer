@@ -1,11 +1,15 @@
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from asn1crypto import cms, core, crl, ocsp, x509
 from dateutil.parser import parse as parse_dt
 
-from ...config_utils import ConfigurableMixin, ConfigurationError
+from ...config_utils import (
+    ConfigurableMixin,
+    ConfigurationError,
+    parse_duration,
+)
 from ...services import CRLBuilder
 from ..common import CertLabel, EntityLabel, KeyLabel, PluginLabel
 from ..plugin_api import SmartValueSpec, process_config_with_smart_value
@@ -16,6 +20,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     'Validity',
+    'TimeRef',
     'ExtensionSpec',
     'RevocationStatus',
     'IssuedItemSpec',
@@ -27,40 +32,162 @@ def _x509_dt_asn1(dt: datetime) -> x509.Time:
     return x509.Time({'utc_time' if dt.year < 2050 else 'general_time': dt})
 
 
+def _parse_absolute_dt(value, owner: str) -> datetime:
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        try:
+            dt = parse_dt(value)
+        except ValueError as e:
+            raise ConfigurationError(
+                f"Illegal date-time string in validity specification "
+                f"for {owner}: {value!r}"
+            ) from e
+    else:
+        raise ConfigurationError(
+            f"Invalid validity endpoint for {owner}: expected an ISO 8601 "
+            f"timestamp or a reference to another certificate, got "
+            f"{value!r}."
+        )
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        raise ConfigurationError(
+            f"Invalid validity endpoint for {owner}: timestamp {value!r} "
+            f"does not specify a timezone/UTC offset."
+        )
+    return dt
+
+
 @dataclass(frozen=True)
-class Validity(ConfigurableMixin):
-    """Validity period of a certificate."""
-
-    valid_from: datetime
+class TimeRef(ConfigurableMixin):
     """
-    Start of validity period. To be specified as an ISO 8601 datetime string
-    (with timezone offset) in the configuration.
+    Reference to a validity endpoint of another certificate, plus an
+    optional offset.
     """
 
-    valid_to: datetime
+    cert: CertLabel
+    """Label of the certificate to anchor to."""
+
+    endpoint: str
     """
-    End of validity period. To be specified as an ISO 8601 datetime string
-    (with timezone offset) in the configuration.
+    Endpoint of the referenced certificate's validity period to anchor to:
+    ``not_before`` or ``not_after``.
+    """
+
+    offset: timedelta = timedelta(0)
+    """
+    Offset to apply to the referenced endpoint, as an ISO 8601 duration
+    (weeks/days/time designations only). Prefix with ``-`` to shift
+    backwards in time.
     """
 
     @classmethod
     def process_entries(cls, config_dict):
         super().process_entries(config_dict)
         try:
-            valid_from_str = config_dict['valid_from']
-            valid_to_str = config_dict['valid_to']
-        except KeyError:
-            return  # constructor will error later
-        try:
-            config_dict['valid_from'] = parse_dt(valid_from_str)
-            config_dict['valid_to'] = parse_dt(valid_to_str)
-        except ValueError as e:
+            endpoint = config_dict['endpoint']
+        except KeyError as e:
             raise ConfigurationError(
-                "Illegal date-time string in validity specification"
+                "Validity references require an 'endpoint' key with value "
+                "'not-before' or 'not-after'."
             ) from e
+        if not isinstance(endpoint, str):
+            raise ConfigurationError(
+                f"Invalid validity reference endpoint {endpoint!r}; expected "
+                f"'not-before' or 'not-after'."
+            )
+        endpoint = endpoint.replace('-', '_')
+        if endpoint not in ('not_before', 'not_after'):
+            raise ConfigurationError(
+                f"Invalid validity reference endpoint {endpoint!r}; expected "
+                f"'not-before' or 'not-after'."
+            )
+        config_dict['endpoint'] = endpoint
+
+        offset_str = config_dict.get('offset')
+        if offset_str is None:
+            offset = timedelta(0)
+        else:
+            if not isinstance(offset_str, str):
+                raise ConfigurationError(
+                    f"Illegal offset in validity reference: {offset_str!r}"
+                )
+            sign = 1
+            if offset_str.startswith('-'):
+                sign = -1
+                offset_str = offset_str[1:]
+            elif offset_str.startswith('+'):
+                offset_str = offset_str[1:]
+            try:
+                offset = sign * parse_duration(offset_str)
+            except ValueError as e:
+                raise ConfigurationError(
+                    f"Illegal offset in validity reference: {offset_str!r}"
+                ) from e
+        config_dict['offset'] = offset
+
+    def __repr__(self):
+        return (
+            f"TimeRef(cert={self.cert.value!r}, endpoint={self.endpoint!r}, "
+            f"offset={self.offset!r})"
+        )
+
+
+@dataclass(frozen=True)
+class Validity(ConfigurableMixin):
+    """Validity period of a certificate."""
+
+    valid_from: Union[datetime, TimeRef]
+    """
+    Start of validity period. To be specified as an ISO 8601 datetime string
+    (with timezone offset) in the configuration, or as a reference to an
+    endpoint of another certificate's validity period (see :class:`TimeRef`).
+    """
+
+    valid_to: Union[datetime, TimeRef]
+    """
+    End of validity period. To be specified as an ISO 8601 datetime string
+    (with timezone offset) in the configuration, or as a reference to an
+    endpoint of another certificate's validity period (see :class:`TimeRef`).
+    """
+
+    @classmethod
+    def process_entries(cls, config_dict):
+        super().process_entries(config_dict)
+        for key in ('valid_from', 'valid_to'):
+            try:
+                value = config_dict[key]
+            except KeyError:
+                continue  # constructor will error later
+            if isinstance(value, (datetime, TimeRef)):
+                if isinstance(value, datetime):
+                    config_dict[key] = _parse_absolute_dt(value, key)
+                continue
+            if isinstance(value, dict):
+                config_dict[key] = TimeRef.from_config(value)
+            else:
+                config_dict[key] = _parse_absolute_dt(value, key)
+
+    @property
+    def resolved(self) -> bool:
+        """
+        Check whether both endpoints of this validity period have been
+        resolved to absolute timestamps.
+        """
+        return isinstance(self.valid_from, datetime) and isinstance(
+            self.valid_to, datetime
+        )
+
+    def _require_resolved(self):
+        if not self.resolved:
+            raise ConfigurationError(
+                "Validity period contains unresolved references to other "
+                "certificates; references must be resolved before the "
+                "validity period can be used."
+            )
 
     @property
     def asn1(self) -> x509.Validity:
+        self._require_resolved()
         return x509.Validity(
             {
                 'not_before': _x509_dt_asn1(self.valid_from),
@@ -70,6 +197,7 @@ class Validity(ConfigurableMixin):
 
     @property
     def att_asn1(self) -> cms.AttCertValidityPeriod:
+        self._require_resolved()
         return cms.AttCertValidityPeriod(
             {
                 'not_before_time': core.GeneralizedTime(self.valid_from),
@@ -294,7 +422,8 @@ class IssuedItemSpec(ConfigurableMixin):
 
         try:
             val_spec = config_dict['validity']
-            config_dict['validity'] = Validity.from_config(val_spec)
+            if not isinstance(val_spec, Validity):
+                config_dict['validity'] = Validity.from_config(val_spec)
         except KeyError:
             pass
 
