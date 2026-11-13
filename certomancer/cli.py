@@ -440,6 +440,35 @@ def seance(
             f.write(data)
 
 
+@cli.command(help='check imported certificates against their specs')
+@click.pass_context
+@click.argument('architecture', type=str, metavar='PKI_ARCH')
+@click.argument('cert_label', type=str, metavar='CERT_LABEL', required=False)
+@exception_manager()
+def preflight(ctx, architecture: str, cert_label: Optional[str]):
+    """
+    Report the results of the import preflight for certificates loaded
+    through ``certificate-file``.
+    """
+
+    cfg: CertomancerConfig = next(ctx.obj['config'])
+    pki_arch = cfg.get_pki_arch(ArchLabel(architecture))
+    results = pki_arch.get_import_preflight_results()
+    if cert_label is not None:
+        try:
+            results = {CertLabel(cert_label): results[CertLabel(cert_label)]}
+        except KeyError:
+            raise click.ClickException(
+                f"No certificate labelled '{cert_label}' was imported into "
+                f"architecture '{architecture}'."
+            )
+    if not results:
+        click.echo("No certificates were imported from disk.")
+        return
+    for check in results.values():
+        click.echo(check.describe())
+
+
 @cli.command(help='run the Animator behind a development server')
 @click.option(
     '--port',

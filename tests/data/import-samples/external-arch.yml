@@ -1,0 +1,40 @@
+keyset: external
+entities:
+  external-ca:
+    country-name: BE
+    organization-name: Testing Authority
+    common-name: External CA
+  external-leaf:
+    country-name: BE
+    organization-name: Testing Authority
+    common-name: External Leaf
+certs:
+  external-ca:
+    certificate-file: external-ca.pem
+    subject: external-ca
+    issuer: external-ca
+    validity:
+      valid-from: 2020-01-01T00:00:00+0000
+      valid-to: 2030-01-01T00:00:00+0000
+    extensions:
+    - id: basic_constraints
+      critical: true
+      value:
+        ca: true
+  external-leaf:
+    certificate-file: external-leaf.pem
+    issuer: external-ca
+    validity:
+      valid-from: 2020-01-01T00:00:00+0000
+      valid-to: 2030-01-01T00:00:00+0000
+services:
+  ocsp:
+    external-ca:
+      for-issuer: external-ca
+      responder-cert: external-ca
+      signing-key: external-ca
+  crl-repo:
+    external-ca:
+      for-issuer: external-ca
+      signing-key: external-ca
+      simulated-update-schedule: P30D

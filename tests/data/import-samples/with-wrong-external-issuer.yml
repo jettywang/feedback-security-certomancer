@@ -1,0 +1,6 @@
+external-url-prefix: "http://test.test"
+keysets:
+  external:
+    keys: {}
+pki-architectures:
+  external: wrong-external-issuer-arch.yml

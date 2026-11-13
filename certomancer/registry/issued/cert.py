@@ -5,7 +5,13 @@ from ..common import CertLabel, EntityLabel, KeyLabel
 from .general import IssuedItemSpec
 
 EXCLUDED_FROM_TEMPLATE = frozenset(
-    {'subject', 'subject_key', 'serial', 'certificate_file'}
+    {
+        'subject',
+        'subject_key',
+        'serial',
+        'certificate_file',
+        'allow_import_mismatch',
+    }
 )
 EXTNS_EXCLUDED_FROM_TEMPLATE = frozenset({'subject_alt_name'})
 
@@ -34,17 +40,36 @@ class CertificateSpec(IssuedItemSpec):
     When the certificate determined by this certificate spec is requested,
     the certificate in the file will be returned.
 
-    .. warning::
-        Certomancer will not attempt to process any information from the
-        certificate file, beyond parsing it into an X.509 certificate structure.
-        Internally, the certificate spec's entries are used instead.
-        It is the config writer's responsibility to make sure that both match
-        up.
+    Certomancer runs a preflight check on the imported certificate before it
+    is accepted. The certificate's subject, issuer, serial number, subject
+    public key and (where applicable) the key that signed it must agree with
+    the data in this spec. Otherwise, OCSP responders and CRL repositories
+    configured for this PKI architecture could answer queries about a
+    different certificate than the one the spec describes. Such conflicts
+    cause a :class:`.ConfigurationError` at load time.
+
+    No private key is required for the imported certificate's subject key, as
+    long as that key is not needed by the configuration. The certificate
+    itself carries no private key; Certomancer only uses its DER content.
 
     .. note::
         This option is unavailable when external configuration is disabled.
         Moreover, it is excluded from templates derived from this certificate
         spec.
+    """
+
+    allow_import_mismatch: bool = False
+    """
+    Deliberately accept an imported certificate that fails the preflight
+    check. This is only intended for test samples that rely on a certificate
+    being inconsistent with its spec (e.g. to test how a client copes with a
+    misissued certificate).
+
+    When set, Certomancer keeps the mismatch visible: it logs a warning
+    describing every discrepancy between the imported certificate and the
+    spec. Impersonated trust services in this architecture (OCSP responders,
+    CRL repositories and certificate repositories) will then answer based on
+    the spec, not on the imported DER. Use this flag sparingly.
     """
 
     @property

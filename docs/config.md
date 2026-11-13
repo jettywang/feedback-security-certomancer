@@ -249,9 +249,51 @@ Here is an overview of the keys that set basic certificate properties and their 
 | `issuer` |Entity label| The label of the entity issuing the certificate.|
 | `authority-key` |Key label| The label of the key that will be used to sign the certificate. Defaults to the value of `issuer`; the same caveats as those for `subject-key` also apply here.|
 | `validity` |dictionary| Takes a dictionary with two keys, `valid-from` and `valid-to`. The values of these should be timestamps specified in ISO 8601 format (including UTC offset).|
-| `serial` |integer| You can manually specify the certificate's serial number if you want. If unspecified, Certomancer will populate this field automatically, making sure that all certificates issued by a given issuer have distinct serial numbers.|
+| `serial` |integer| You can manually specify the certificate's serial number if you want. If unspecified, Certomancer will populate this field automatically, making sure that all certificates issued by a given issuer have distinct serial numbers. For certificates imported via `certificate-file`, an unspecified serial is taken from the imported DER; if you do specify one, the preflight check enforces it.|
 | `issuer-cert` |Cert label| You can optionally specify the "preferred" issuer's certificate to use when required by Certomancer's trust services. In principle, this isn't relevant for the certificate signing process itself, but having a preferred issuer certificate lying around is sometimes convenient for a variety of reasons. If the issuing entity has exactly one certificate issued to it, you don't need to worry about this setting.|
+| `certificate-file` |string| Path to a pre-generated certificate (PEM or DER) to serve instead of a Certomancer-generated one. The file is resolved relative to the external config directory. Imported certificates are subject to the preflight check described [below](#importing-certificates).|
+| `allow-import-mismatch` |boolean| Deliberately accept an imported certificate that fails the preflight check. Only intended for negative test samples; the diagnostics are logged and retained. Defaults to `false`.|
 
+
+#### Importing certificates
+
+Instead of letting Certomancer issue a certificate, you can point a certificate spec at a
+pre-generated certificate using `certificate-file`. The imported certificate is served verbatim
+(including from the certificate repository and in OCSP responses), but it is *not* used to derive
+the identity that trust services reason about: OCSP and CRL responses are still generated from the
+certificate spec. If the two disagree, those services would answer about a different certificate
+than the one clients actually see.
+
+To prevent that, Certomancer runs a preflight check on every imported certificate. The check
+compares the certificate's DER content against the configuration:
+
+ - the **subject** and **issuer** distinguished names must match the configured entities
+   (compared per RFC 5280, so equivalent string encodings are accepted);
+ - the **serial number** in the DER must match `serial`, and must not collide with the serial of
+   another certificate issued by the same entity;
+ - the **subject public key info** must match the subject key in the key set, when that key is
+   available;
+ - the certificate's **signature** must verify against the configured `authority-key`, or against
+   the subject key of the configured `issuer-cert`. This catches same-subject-name key rollovers,
+   where only the key (not the name) differs.
+
+If any of these checks fails, Certomancer refuses to load the architecture and reports the
+discrepancy, including the OCSP responders, CRL repositories and certificate repositories in that
+architecture that would otherwise answer based on the spec.
+
+Importing a certificate does not require a local private key for its subject key, and neither does
+importing a CA. This makes it possible to model external issuers. When `serial` is omitted for an
+imported certificate, it is taken from the DER. A certificate spec declared *earlier* in the same
+architecture that was not imported still uses Certomancer-generated serials, so cross-checking is
+always against effective serial numbers.
+
+If you need an intentionally inconsistent test sample (e.g. to exercise client behaviour when a CA
+misissues a certificate), set `allow-import-mismatch: true` on the relevant certificate spec. The
+mismatch is then accepted, but the discrepancies are logged and retained in
+`PKIArchitecture.get_import_preflight_results()`, and the `certomancer preflight` command reports
+them. Only the imported certificate's DER is served verbatim; trust services keep answering based
+on the spec, so an imported certificate with an inconsistent serial is not the one OCSP/CRL will
+report on.
 
 #### Certificate extensions
 

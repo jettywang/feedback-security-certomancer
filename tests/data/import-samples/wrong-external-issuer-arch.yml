@@ -1,0 +1,55 @@
+keyset: external
+entities:
+  external-ca:
+    country-name: BE
+    organization-name: Testing Authority
+    common-name: External CA
+  external-leaf:
+    country-name: BE
+    organization-name: Testing Authority
+    common-name: External Leaf
+  impostor-ca:
+    country-name: BE
+    organization-name: Testing Authority
+    common-name: External CA
+certs:
+  external-ca:
+    certificate-file: external-ca.pem
+    subject: external-ca
+    issuer: external-ca
+    serial: 12288
+    validity:
+      valid-from: 2020-01-01T00:00:00+0000
+      valid-to: 2030-01-01T00:00:00+0000
+    extensions:
+    - id: basic_constraints
+      critical: true
+      value:
+        ca: true
+  impostor-ca:
+    certificate-file: impostor-ca.pem
+    subject: impostor-ca
+    issuer: impostor-ca
+    serial: 12288
+    validity:
+      valid-from: 2020-01-01T00:00:00+0000
+      valid-to: 2030-01-01T00:00:00+0000
+    extensions:
+    - id: basic_constraints
+      critical: true
+      value:
+        ca: true
+  external-leaf:
+    certificate-file: external-leaf.pem
+    issuer: impostor-ca
+    issuer-cert: impostor-ca
+    serial: 12289
+    validity:
+      valid-from: 2020-01-01T00:00:00+0000
+      valid-to: 2030-01-01T00:00:00+0000
+services:
+  ocsp:
+    impostor-ca:
+      for-issuer: impostor-ca
+      responder-cert: impostor-ca
+      signing-key: impostor-ca

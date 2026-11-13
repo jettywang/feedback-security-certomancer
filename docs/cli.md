@@ -23,6 +23,7 @@ The `certomancer` script currently has six subcommands:
  * `mass-summon`: create and output all certificates for a Certomancer PKI architecture
  * `necronomicon`: create and output a CRL
  * `seance`: generate OCSP responses
+ * `preflight`: report the import preflight results for imported certificates
  * `alch`: write keys and certificates to a PKCS#11 token
 
 ## Core config flags
@@ -181,3 +182,18 @@ certificate label in the Certomancer configuration. The `CKA_ID` attribute will 
 
 **WARNING:** The `alch` command is currently _not_ idempotent. Running it multiple times with the same input data is
 inadvisable.
+
+
+# Checking imported certificates
+
+Certificates loaded through `certificate-file` are checked against their specs at load time; see
+[the corresponding section in the config docs](config.md#importing-certificates). To inspect the
+retained diagnostics — especially for certificates accepted via `allow-import-mismatch: true` — use
+
+```
+certomancer preflight PKI_ARCH [CERT_LABEL]
+```
+
+The command prints one line per imported certificate, listing every discrepancy between the DER
+and the spec, and the OCSP responders / CRL repositories / certificate repositories that answer
+based on the spec.

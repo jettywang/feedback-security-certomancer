@@ -1,4 +1,5 @@
 import copy
+import dataclasses
 import itertools
 import os
 import os.path
@@ -38,6 +39,11 @@ from .common import (
     ServiceLabel,
 )
 from .entities import EntityRegistry, as_general_name
+from .import_check import (
+    ImportedCertificateCheck,
+    enforce_import_preflight,
+    run_import_preflight,
+)
 from .issued.attr_cert import AttributeCertificateSpec
 from .issued.cert import CertificateSpec
 from .issued.general import IssuedItemSpec, RevocationStatus
@@ -97,6 +103,9 @@ def _config_issuer_serial(
     effective_cert_config.setdefault('authority_key', issuer)
     serial = state.serial_by_issuer[EntityLabel(issuer)]
     effective_cert_config.setdefault('serial', serial)
+    # An imported certificate with an implicit serial inherits the serial
+    # number from its DER content later on. Still advance the per-issuer
+    # counter to avoid handing out a colliding serial to the next spec.
     state.serial_by_issuer[EntityLabel(issuer)] = serial + 1
     return EntityLabel(issuer)
 
@@ -181,6 +190,7 @@ def _process_single_cert_spec(
     effective_cert_config.setdefault(
         'subject_key', effective_cert_config['subject']
     )
+    serial_was_explicit = 'serial' in effective_cert_config
     _config_issuer_serial(state, name, effective_cert_config)
 
     state.cert_specs[name] = spec = CertificateSpec.from_config(
@@ -201,6 +211,13 @@ def _process_single_cert_spec(
                 f"Failed to load pregenerated cert with name {name}"
                 f"from file {full_path}."
             ) from e
+        if not serial_was_explicit:
+            # The data in the imported certificate is authoritative for the
+            # serial number when the config doesn't pin one down. OCSP and CRL
+            # lookups operate on the DER, so aligning the spec avoids spurious
+            # mismatches for legitimate external certificates.
+            spec = dataclasses.replace(spec, serial=pregenerated.serial_number)
+            state.cert_specs[name] = spec
     state.cert_labels_by_issuer[spec.issuer].append(name)
     state.cert_labels_by_subject[spec.subject].append(name)
 
@@ -491,6 +508,36 @@ class PKIArchitecture:
         )
         self._cert_cache = cert_cache
         self._ac_cache = ac_cache
+
+        # Run the preflight checks for certificates imported through
+        # certificate-file. Service configuration is available at this point,
+        # so the diagnostics can name the services that would otherwise answer
+        # based on the spec rather than on the imported DER.
+        self._import_preflight_results: Dict[
+            CertLabel, ImportedCertificateCheck
+        ] = {}
+        for label in list(self._cert_specs.keys()):
+            spec = self._cert_specs[label]
+            if spec.certificate_file is None:
+                continue
+            check = run_import_preflight(
+                self, label, self._cert_cache[label], spec
+            )
+            self._import_preflight_results[label] = check
+            enforce_import_preflight(check)
+
+    def get_import_preflight_results(
+        self,
+    ) -> Dict[CertLabel, ImportedCertificateCheck]:
+        """
+        Return the preflight results for certificates imported through
+        ``certificate-file``, keyed by cert label.
+
+        The results are retained even for certificates that passed with
+        ``allow-import-mismatch`` set, so diagnostics survive the check.
+        """
+
+        return dict(self._import_preflight_results)
 
     def get_cert_spec(self, label: CertLabel) -> CertificateSpec:
         try:
