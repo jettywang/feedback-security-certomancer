@@ -52,6 +52,8 @@ class TimeStamper:
         fixed_dt: Optional[datetime] = None,
         policy=tsp.ObjectIdentifier('1.3.6.1.4.1.4146.2.3'),
         md_algorithm='sha256',
+        accepted_policies=None,
+        accepted_md_algorithms=None,
     ):
         self.tsa_cert = tsa_cert
         self.tsa_key = tsa_key
@@ -59,15 +61,73 @@ class TimeStamper:
         self.fixed_dt = fixed_dt
         self.policy = policy
         self.md_algorithm = md_algorithm
+        policy_set = {self._policy_str(policy)}
+        policy_set |= {
+            self._policy_str(p) for p in (accepted_policies or ())
+        }
+        self.accepted_policies = frozenset(policy_set)
+        self.accepted_md_algorithms = frozenset(
+            accepted_md_algorithms or (md_algorithm,)
+        )
         self.signature_algo = signature_algo or choose_signed_digest(
             md_algorithm, tsa_cert.public_key
         )
 
+    @staticmethod
+    def _policy_str(policy) -> str:
+        if isinstance(policy, core.ObjectIdentifier):
+            return policy.native
+        return str(policy)
+
+    @staticmethod
+    def _rejection(fail_info: str, status_text: str) -> tsp.TimeStampResp:
+        # A rejection MUST NOT come with a (potentially usable) token,
+        # so we only return a PKIStatusInfo here.
+        status = tsp.PKIStatusInfo(
+            {
+                'status': tsp.PKIStatus('rejection'),
+                'status_string': tsp.PKIFreeText([status_text]),
+                'fail_info': tsp.PKIFailureInfo({fail_info}),
+            }
+        )
+        return tsp.TimeStampResp({'status': status})
+
     def request_tsa_response(self, req: tsp.TimeStampReq) -> tsp.TimeStampResp:
-        # We pretend that certReq is always true in the request
+        message_imprint: tsp.MessageImprint = req['message_imprint']
+        imprint_algo = message_imprint['hash_algorithm']['algorithm'].native
+        if imprint_algo not in self.accepted_md_algorithms:
+            return self._rejection(
+                'bad_alg',
+                f"Digest algorithm {imprint_algo!r} is not supported "
+                "by this TSA.",
+            )
+        try:
+            digest_size = hashlib.new(imprint_algo).digest_size
+        except (ValueError, TypeError):
+            return self._rejection(
+                'bad_alg',
+                f"Digest algorithm {imprint_algo!r} is not supported "
+                "by this TSA.",
+            )
+        if len(message_imprint['hashed_message'].native) != digest_size:
+            return self._rejection(
+                'bad_data_format',
+                "Message imprint digest length does not match "
+                f"the output size of {imprint_algo}.",
+            )
+
+        req_policy = req['req_policy']
+        if isinstance(req_policy, core.ObjectIdentifier):
+            policy = req_policy.native
+            if policy not in self.accepted_policies:
+                return self._rejection(
+                    'unaccepted_policy',
+                    f"Policy {policy} is not acceptable to this TSA.",
+                )
+        else:
+            policy = self.policy
 
         status = tsp.PKIStatusInfo({'status': tsp.PKIStatus('granted')})
-        message_imprint: tsp.MessageImprint = req['message_imprint']
         md_algorithm = self.md_algorithm
         digest_algorithm_obj = algos.DigestAlgorithm(
             {'algorithm': md_algorithm}
@@ -75,7 +135,7 @@ class TimeStamper:
         dt = self.fixed_dt or datetime.now(tz=timezone.utc)
         tst_info_dict = {
             'version': 'v1',
-            'policy': self.policy,
+            'policy': policy,
             'message_imprint': message_imprint,
             'serial_number': get_nonce(),
             'gen_time': dt,
@@ -128,8 +188,6 @@ class TimeStamper:
                 'signature': signature,
             }
         )
-        certs = set(self.certs_to_embed)
-        certs.add(self.tsa_cert)
         signed_data = {
             # must use v3 to get access to the EncapsulatedContentInfo construct
             'version': 'v3',
@@ -140,9 +198,12 @@ class TimeStamper:
                     'content': cms.ParsableOctetString(tst_info_data),
                 }
             ),
-            'certificates': certs,
             'signer_infos': [sig_info],
         }
+        if req['cert_req'].native:
+            certs = set(self.certs_to_embed)
+            certs.add(self.tsa_cert)
+            signed_data['certificates'] = certs
         tst = cms.ContentInfo(
             {
                 'content_type': cms.ContentType('signed_data'),

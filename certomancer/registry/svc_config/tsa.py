@@ -36,6 +36,19 @@ class TSAServiceInfo(ServiceInfo):
     certs_to_embed: List[CertLabel] = field(default_factory=list)
     """Extra certificates to embed."""
 
+    policies: List[str] = field(default_factory=list)
+    """
+    Accepted TSA policy OIDs (dotted strings). The first entry doubles as
+    the policy put into tokens for requests that do not specify one.
+    If empty, the built-in default policy is used.
+    """
+
+    accepted_digest_algos: List[str] = field(default_factory=list)
+    """
+    Digest algorithms accepted in request message imprints.
+    Defaults to :attr:`digest_algo`.
+    """
+
     @classmethod
     def process_entries(cls, config_dict):
         try:

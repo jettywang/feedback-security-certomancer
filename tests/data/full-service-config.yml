@@ -188,6 +188,11 @@ services:
     tsa:
       signing-key: tsa
       signing-cert: tsa
+      policies:
+        - 1.3.6.1.4.1.4146.2.3
+      accepted-digest-algos:
+        - sha256
+        - sha512
     tsa2:
       signing-key: tsa2
       signing-cert: tsa2

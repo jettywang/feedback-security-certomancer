@@ -1265,10 +1265,17 @@ class ServiceRegistry:
     def summon_timestamper(
         self, label: ServiceLabel, at_time=None
     ) -> TimeStamper:
-        # TODO allow policy parameter to be customised
         info = self.get_tsa_info(label)
         tsa_key = self.pki_arch.key_set.get_private_key(info.signing_key)
         tsa_cert = self.pki_arch.get_cert(info.signing_cert)
+        policy_kwargs = {}
+        if info.policies:
+            policy_kwargs['policy'] = info.policies[0]
+            policy_kwargs['accepted_policies'] = info.policies
+        if info.accepted_digest_algos:
+            policy_kwargs['accepted_md_algorithms'] = (
+                info.accepted_digest_algos
+            )
         return TimeStamper(
             tsa_cert=tsa_cert,
             tsa_key=tsa_key,
@@ -1282,6 +1289,7 @@ class ServiceRegistry:
                 self.pki_arch.get_cert(lbl) for lbl in info.certs_to_embed
             ],
             md_algorithm=info.digest_algo,
+            **policy_kwargs,
         )
 
     def get_crl(

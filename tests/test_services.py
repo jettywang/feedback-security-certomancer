@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 import requests
 from asn1crypto import algos, cms, core, crl, ocsp, tsp, x509
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -283,6 +283,140 @@ def test_timestamp(requests_mock, setup, include_nonce):
     assert tst_info['gen_time'].native == datetime.now().replace(
         tzinfo=timezone.utc
     )
+
+
+TSA_POLICY = '1.3.6.1.4.1.4146.2.3'
+
+
+def _tsa_req(
+    imprint_algo='sha256',
+    digest=None,
+    policy=None,
+    nonce=None,
+    cert_req=None,
+):
+    if digest is None:
+        digest = hashlib.new(imprint_algo, b'test').digest()
+    req_data = {
+        'version': 'v2',
+        'message_imprint': tsp.MessageImprint(
+            {
+                'hash_algorithm': algos.DigestAlgorithm(
+                    {'algorithm': imprint_algo}
+                ),
+                'hashed_message': digest,
+            }
+        ),
+    }
+    if policy is not None:
+        req_data['req_policy'] = tsp.ObjectIdentifier(policy)
+    if nonce is not None:
+        req_data['nonce'] = core.Integer(nonce)
+    if cert_req is not None:
+        req_data['cert_req'] = cert_req
+    return tsp.TimeStampReq(req_data)
+
+
+def _summon_tsa():
+    return RSA_SETUP.arch.service_registry.summon_timestamper(
+        ServiceLabel('tsa')
+    )
+
+
+@freeze_time('2020-11-01')
+def test_timestamp_offline_granted():
+    tsa = _summon_tsa()
+    req = _tsa_req(policy=TSA_POLICY, nonce=0x1337, cert_req=True)
+    resp = tsa.request_tsa_response(req)
+    assert resp['status']['status'].native == 'granted'
+
+    sd = resp['time_stamp_token']['content']
+    tst_info: tsp.TSTInfo = sd['encap_content_info']['content'].parsed
+    assert tst_info['nonce'].native == 0x1337
+    assert tst_info['policy'].native == TSA_POLICY
+    imprint = tst_info['message_imprint']
+    assert imprint['hash_algorithm']['algorithm'].native == 'sha256'
+    assert imprint['hashed_message'].native == hashlib.sha256(b'test').digest()
+
+    # the TSA's own certificate must be embedded on certReq=true
+    tsa_cert = RSA_SETUP.arch.get_cert(CertLabel('tsa'))
+    embedded = {choice.chosen.dump() for choice in sd['certificates']}
+    assert tsa_cert.dump() in embedded
+
+    # verify the signature over the TSTInfo offline
+    signer_info = sd['signer_infos'][0]
+    signed_attrs = signer_info['signed_attrs']
+    md_attr = next(
+        attr['values'][0].native
+        for attr in signed_attrs
+        if attr['type'].native == 'message_digest'
+    )
+    assert md_attr == hashlib.sha256(tst_info.dump()).digest()
+    pub = serialization.load_der_public_key(tsa_cert.public_key.dump())
+    pub.verify(
+        signer_info['signature'].native,
+        signed_attrs.untag().dump(),
+        padding.PKCS1v15(),
+        hashes.SHA256(),
+    )
+
+
+@freeze_time('2020-11-01')
+def test_timestamp_offline_alternative_digest():
+    tsa = _summon_tsa()
+    req = _tsa_req(imprint_algo='sha512', cert_req=True)
+    resp = tsa.request_tsa_response(req)
+    assert resp['status']['status'].native == 'granted'
+    sd = resp['time_stamp_token']['content']
+    tst_info: tsp.TSTInfo = sd['encap_content_info']['content'].parsed
+    imprint = tst_info['message_imprint']
+    assert imprint['hash_algorithm']['algorithm'].native == 'sha512'
+    assert imprint['hashed_message'].native == hashlib.sha512(b'test').digest()
+
+
+@freeze_time('2020-11-01')
+@pytest.mark.parametrize('cert_req', [None, False])
+def test_timestamp_offline_cert_req_false(cert_req):
+    tsa = _summon_tsa()
+    req = _tsa_req(cert_req=cert_req)
+    resp = tsa.request_tsa_response(req)
+    assert resp['status']['status'].native == 'granted'
+    sd = resp['time_stamp_token']['content']
+    # no certificates may be embedded when certReq is false/absent
+    assert isinstance(sd['certificates'], core.Void)
+
+
+@freeze_time('2020-11-01')
+def test_timestamp_offline_unaccepted_policy():
+    tsa = _summon_tsa()
+    req = _tsa_req(policy='1.2.3.4', cert_req=True)
+    resp = tsa.request_tsa_response(req)
+    assert resp['status']['status'].native == 'rejection'
+    assert resp['status']['fail_info'].native == {'unaccepted_policy'}
+    assert len(resp['status']['status_string']) == 1
+    # a rejection must not come with a usable token
+    assert isinstance(resp['time_stamp_token'], core.Void)
+
+
+@freeze_time('2020-11-01')
+def test_timestamp_offline_bad_digest_algorithm():
+    tsa = _summon_tsa()
+    req = _tsa_req(imprint_algo='md5', cert_req=True)
+    resp = tsa.request_tsa_response(req)
+    assert resp['status']['status'].native == 'rejection'
+    assert resp['status']['fail_info'].native == {'bad_alg'}
+    assert isinstance(resp['time_stamp_token'], core.Void)
+
+
+@freeze_time('2020-11-01')
+def test_timestamp_offline_malformed_digest():
+    tsa = _summon_tsa()
+    # 16 bytes is not a valid SHA-256 output length
+    req = _tsa_req(digest=b'\x01' * 16, cert_req=True)
+    resp = tsa.request_tsa_response(req)
+    assert resp['status']['status'].native == 'rejection'
+    assert resp['status']['fail_info'].native == {'bad_data_format'}
+    assert isinstance(resp['time_stamp_token'], core.Void)
 
 
 @pytest.mark.parametrize(

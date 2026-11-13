@@ -972,6 +972,8 @@ settings are available.
 | --- | --- | --- |
 | `signing-cert` |Cert label| TSA cert to use.|
 | `signing-key` |Key label| Key label to indicate the key that will be used to sign the OCSP responses. <br>Defaults to the value of `signing-cert`, if a key with the same label exists.|
+| `policies` |list of strings| Accepted TSA policy OIDs (dotted strings). The first entry doubles as the policy put into tokens for requests that do not specify one. <br>If empty, the built-in default policy is used.|
+| `accepted-digest-algos` |list of strings| Digest algorithms accepted in request message imprints. <br>Defaults to the value of `digest-algo`.|
 
 
 #### Certificate repositories
