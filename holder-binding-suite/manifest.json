@@ -1,0 +1,275 @@
+{
+  "pkcs": {
+    "root": {
+      "file": "certs/root.pem",
+      "subject": "Common Name: Holder Binding Root CA, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+      "issuer": "Common Name: Holder Binding Root CA, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+      "serial": 4096,
+      "spki_sha256": "9b1c70104ddb1814eecf7b6ea26704bdeba101aef387145471dd9ee32d9722cc",
+      "cert_sha256": "bf8d4adf72bb277927f9cc57b5f7834b8309c2eaa241b69f2266c66e7d80f411",
+      "not_before": "2024-01-01T00:00:00+00:00",
+      "not_after": "2048-01-01T00:00:00+00:00"
+    },
+    "role-aa": {
+      "file": "certs/role-aa.pem",
+      "subject": "Common Name: Holder Attribute Authority, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+      "issuer": "Common Name: Holder Binding Root CA, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+      "serial": 4097,
+      "spki_sha256": "d3e7f544cd3da4e4b8a35e2dcf7ae3519800117fa728542d0dadef9ba1b4dc18",
+      "cert_sha256": "1b2ff17c62cf6731d3b46bbdab0c7481f17860f11908970b8b23b53bc43ee6c6",
+      "not_before": "2024-01-01T00:00:00+00:00",
+      "not_after": "2048-01-01T00:00:00+00:00"
+    },
+    "alice-a": {
+      "file": "certs/alice-a.pem",
+      "subject": "Common Name: Alice Holder, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+      "issuer": "Common Name: Holder Binding Root CA, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+      "serial": 4098,
+      "spki_sha256": "3f6387e77933f979d20b936d361e889ba581cc80b3a265a1468414573b31872a",
+      "cert_sha256": "49ff84d02454c1b4d502de868e8ef8de8dc9e92207ea74922693e9d23060dc7a",
+      "not_before": "2024-01-01T00:00:00+00:00",
+      "not_after": "2030-01-01T00:00:00+00:00"
+    },
+    "alice-b": {
+      "file": "certs/alice-b.pem",
+      "subject": "Common Name: Alice Holder, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+      "issuer": "Common Name: Holder Binding Root CA, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+      "serial": 4099,
+      "spki_sha256": "4305d0cdcd6ed72425893d7689825cbfcc7a10277b5af8de8d5e1ad42bf990d8",
+      "cert_sha256": "8c7a6f933311e6d2a7bfc752ea940642652e78824eb4732a0f28b0423dce7907",
+      "not_before": "2024-01-01T00:00:00+00:00",
+      "not_after": "2030-01-01T00:00:00+00:00"
+    },
+    "alice-c": {
+      "file": "certs/alice-c.pem",
+      "subject": "Common Name: Alice Holder, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+      "issuer": "Common Name: Holder Binding Root CA, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+      "serial": 4101,
+      "spki_sha256": "3f6387e77933f979d20b936d361e889ba581cc80b3a265a1468414573b31872a",
+      "cert_sha256": "25f462e505ec38437533e976b49b62fa8c7431ed4a47948b35c29a05a16581d2",
+      "not_before": "2024-01-01T00:00:00+00:00",
+      "not_after": "2030-01-01T00:00:00+00:00"
+    },
+    "carol": {
+      "file": "certs/carol.pem",
+      "subject": "Common Name: Alice Holder, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+      "issuer": "Common Name: Holder Binding Root CA, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+      "serial": 4100,
+      "spki_sha256": "c91a6218779bb282c583c60b7924c70919303a1eb9fc89257d38056f67a0f275",
+      "cert_sha256": "c8412dc631b20a3f3e7a276b2560803555f1ca20a437b27a4e16b2cd0a1b6f13",
+      "not_before": "2024-01-01T00:00:00+00:00",
+      "not_after": "2030-01-01T00:00:00+00:00"
+    }
+  },
+  "attr_certs": {
+    "ac-a-basecertid": {
+      "file": "certs/ac-a-basecertid.pem",
+      "serial": 4096,
+      "signature_algorithm": "sha256_rsa",
+      "holder": {
+        "present": [
+          "baseCertificateID"
+        ],
+        "baseCertificateID": {
+          "serial": 4098,
+          "issuer_general_name": "Common Name: Holder Binding Root CA, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US"
+        }
+      },
+      "targets": [
+        "target_name:Common Name: Payments Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+        "target_name:Common Name: Readonly Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US"
+      ],
+      "attributes": [
+        "role"
+      ]
+    },
+    "ac-a-entityname": {
+      "file": "certs/ac-a-entityname.pem",
+      "serial": 4097,
+      "signature_algorithm": "sha256_rsa",
+      "holder": {
+        "present": [
+          "entityName"
+        ],
+        "entityName": [
+          "Common Name: Alice Holder, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US"
+        ]
+      },
+      "targets": [
+        "target_name:Common Name: Payments Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+        "target_name:Common Name: Readonly Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US"
+      ],
+      "attributes": [
+        "role"
+      ]
+    },
+    "ac-a-spki-digest": {
+      "file": "certs/ac-a-spki-digest.pem",
+      "serial": 4098,
+      "signature_algorithm": "sha256_rsa",
+      "holder": {
+        "present": [
+          "objectDigestInfo"
+        ],
+        "objectDigestInfo": {
+          "digested_object_type": "public_key",
+          "digest_algorithm": "sha256",
+          "object_digest_hex": "3f6387e77933f979d20b936d361e889ba581cc80b3a265a1468414573b31872a"
+        }
+      },
+      "targets": [
+        "target_name:Common Name: Payments Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+        "target_name:Common Name: Readonly Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US"
+      ],
+      "attributes": [
+        "role"
+      ]
+    },
+    "ac-a-certdigest": {
+      "file": "certs/ac-a-certdigest.pem",
+      "serial": 4099,
+      "signature_algorithm": "sha256_rsa",
+      "holder": {
+        "present": [
+          "objectDigestInfo"
+        ],
+        "objectDigestInfo": {
+          "digested_object_type": "public_key_cert",
+          "digest_algorithm": "sha256",
+          "object_digest_hex": "49ff84d02454c1b4d502de868e8ef8de8dc9e92207ea74922693e9d23060dc7a"
+        }
+      },
+      "targets": [
+        "target_name:Common Name: Payments Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+        "target_name:Common Name: Readonly Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US"
+      ],
+      "attributes": [
+        "role"
+      ]
+    },
+    "ac-a-combined": {
+      "file": "certs/ac-a-combined.pem",
+      "serial": 4100,
+      "signature_algorithm": "sha256_rsa",
+      "holder": {
+        "present": [
+          "baseCertificateID",
+          "entityName"
+        ],
+        "baseCertificateID": {
+          "serial": 4098,
+          "issuer_general_name": "Common Name: Holder Binding Root CA, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US"
+        },
+        "entityName": [
+          "Common Name: Alice Holder, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US"
+        ]
+      },
+      "targets": [
+        "target_name:Common Name: Payments Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+        "target_name:Common Name: Readonly Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US"
+      ],
+      "attributes": [
+        "role"
+      ]
+    },
+    "ac-b-basecertid": {
+      "file": "certs/ac-b-basecertid.pem",
+      "serial": 4101,
+      "signature_algorithm": "sha256_rsa",
+      "holder": {
+        "present": [
+          "baseCertificateID"
+        ],
+        "baseCertificateID": {
+          "serial": 4101,
+          "issuer_general_name": "Common Name: Holder Binding Root CA, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US"
+        }
+      },
+      "targets": [
+        "target_name:Common Name: Payments Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+        "target_name:Common Name: Readonly Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US"
+      ],
+      "attributes": [
+        "role"
+      ]
+    },
+    "ac-b-entityname": {
+      "file": "certs/ac-b-entityname.pem",
+      "serial": 4102,
+      "signature_algorithm": "sha256_rsa",
+      "holder": {
+        "present": [
+          "entityName"
+        ],
+        "entityName": [
+          "Common Name: Alice Holder, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US"
+        ]
+      },
+      "targets": [
+        "target_name:Common Name: Payments Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+        "target_name:Common Name: Readonly Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US"
+      ],
+      "attributes": [
+        "role"
+      ]
+    },
+    "ac-b-spki-digest": {
+      "file": "certs/ac-b-spki-digest.pem",
+      "serial": 4103,
+      "signature_algorithm": "sha256_rsa",
+      "holder": {
+        "present": [
+          "objectDigestInfo"
+        ],
+        "objectDigestInfo": {
+          "digested_object_type": "public_key",
+          "digest_algorithm": "sha256",
+          "object_digest_hex": "3f6387e77933f979d20b936d361e889ba581cc80b3a265a1468414573b31872a"
+        }
+      },
+      "targets": [
+        "target_name:Common Name: Payments Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+        "target_name:Common Name: Readonly Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US"
+      ],
+      "attributes": [
+        "role"
+      ]
+    },
+    "ac-b-certdigest": {
+      "file": "certs/ac-b-certdigest.pem",
+      "serial": 4104,
+      "signature_algorithm": "sha256_rsa",
+      "holder": {
+        "present": [
+          "objectDigestInfo"
+        ],
+        "objectDigestInfo": {
+          "digested_object_type": "public_key_cert",
+          "digest_algorithm": "sha256",
+          "object_digest_hex": "25f462e505ec38437533e976b49b62fa8c7431ed4a47948b35c29a05a16581d2"
+        }
+      },
+      "targets": [
+        "target_name:Common Name: Payments Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US",
+        "target_name:Common Name: Readonly Service, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US"
+      ],
+      "attributes": [
+        "role"
+      ]
+    }
+  },
+  "subjects": {
+    "Common Name: Holder Binding Root CA, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US": [
+      "root"
+    ],
+    "Common Name: Holder Attribute Authority, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US": [
+      "role-aa"
+    ],
+    "Common Name: Alice Holder, Organizational Unit: Authorization Lab, Organization: Holder Binding Test Org, Country: US": [
+      "alice-a",
+      "alice-b",
+      "alice-c",
+      "carol"
+    ]
+  }
+}

@@ -1,0 +1,268 @@
+# =============================================================================
+# Holder-binding regression suite (RFC 5755 attribute certificates)
+#
+# Two control groups share one PKI architecture:
+#
+#   * Group A "same name, different key":
+#       - alice-a : CN=Alice Holder, key alice-key-1  (the original holder)
+#       - alice-b : CN=Alice Holder, key alice-key-2  (same DN, NEW key)
+#       - carol   : CN=Alice Holder, key carol-key    (same DN, FOREIGN key)
+#
+#   * Group B "same key, re-certified":
+#       - alice-a : original cert (serial N,   SPKI = alice-key-1)
+#       - alice-c : renewed cert (serial N+1, SAME SPKI alice-key-1)
+#
+# Every attribute certificate is signed by `role-aa` (key `aa`), carries the
+# role attribute id-role-hold-admin, and a CRITICAL targetInformation
+# extension limiting it to two services. All ACs have valid signatures by
+# construction; the point of the suite is holder matching, not signing.
+# =============================================================================
+external-url-prefix: "http://holder-binding-suite.test"
+
+keysets:
+  suite:
+    path-prefix: keys
+    keys:
+      root:
+        path: root.key.pem
+      aa:
+        path: aa.key.pem
+      alice-key-1:
+        path: alice-key-1.key.pem
+      alice-key-2:
+        path: alice-key-2.key.pem
+      carol-key:
+        path: carol-key.key.pem
+
+pki-architectures:
+  holder-binding:
+    keyset: suite
+    entity-defaults:
+      country-name: US
+      organization-name: Holder Binding Test Org
+      organizational-unit-name: Authorization Lab
+    entities:
+      root:
+        common-name: Holder Binding Root CA
+      aa:
+        common-name: Holder Attribute Authority
+      # The three holder entities deliberately carry the SAME distinguished
+      # name. Certomancer keys them by label, not by DN.
+      alice:
+        common-name: Alice Holder
+      carol:
+        common-name: Alice Holder
+      # Target services (no certificates required; names only).
+      svc-payments:
+        common-name: Payments Service
+      svc-readonly:
+        common-name: Readonly Service
+      svc-other:
+        common-name: Other Service
+
+    certs:
+      root:
+        subject: root
+        subject-key: root
+        issuer: root
+        authority-key: root
+        validity: &anchor-validity
+          valid-from: "2024-01-01T00:00:00+0000"
+          valid-to: "2048-01-01T00:00:00+0000"
+        extensions:
+          - id: basic_constraints
+            critical: true
+            value:
+              ca: true
+          - id: key_usage
+            critical: true
+            smart-value:
+              schema: key-usage
+              params: [key_cert_sign, crl_sign]
+
+      role-aa:
+        subject: aa
+        subject-key: aa
+        issuer: root
+        authority-key: root
+        validity: *anchor-validity
+        extensions:
+          - id: basic_constraints
+            critical: true
+            value:
+              ca: true
+              path_len_constraint: 0
+          - id: key_usage
+            critical: true
+            smart-value:
+              schema: key-usage
+              params: [digital_signature]
+          - id: aa_controls
+            critical: true
+            value:
+              path_len_constraint: 0
+              permitted_attrs: ['role']
+
+      # --- Group A / B holder public-key certificates ----------------------
+      alice-a:
+        subject: alice
+        subject-key: alice-key-1
+        issuer: root
+        authority-key: root
+        validity: &holder-validity
+          valid-from: "2024-01-01T00:00:00+0000"
+          valid-to: "2030-01-01T00:00:00+0000"
+
+      alice-b:
+        subject: alice
+        subject-key: alice-key-2
+        issuer: root
+        authority-key: root
+        validity: *holder-validity
+
+      carol:
+        subject: carol
+        subject-key: carol-key
+        issuer: root
+        authority-key: root
+        validity: *holder-validity
+
+      # Group B: same SPKI as alice-a (alice-key-1), but a brand-new
+      # certificate with a different serial and a re-signed TBS.
+      alice-c:
+        subject: alice
+        subject-key: alice-key-1
+        issuer: root
+        authority-key: root
+        validity: *holder-validity
+
+    attr-certs:
+      # ===================== GROUP A: bound to alice-a =====================
+      ac-a-basecertid:
+        holder:
+          name: alice
+          cert: alice-a
+        issuer: aa
+        issuer-cert: role-aa
+        attributes: &role-attrs
+          - id: role
+            smart-value:
+              schema: role-syntax
+              params:
+                name: {type: dns_name, value: hold-admin.holder-binding-suite.test}
+        validity: &ac-validity
+          valid-from: "2024-06-01T00:00:00+0000"
+          valid-to: "2030-01-01T00:00:00+0000"
+        extensions: &target-exts
+          - id: target_information
+            critical: true
+            smart-value:
+              schema: ac-targets
+              params:
+                - svc-payments
+                - svc-readonly
+
+      ac-a-entityname:
+        holder:
+          name: alice
+          cert: alice-a
+          include-base-cert-id: false
+          include-entity-name: true
+        issuer: aa
+        issuer-cert: role-aa
+        attributes: *role-attrs
+        validity: *ac-validity
+        extensions: *target-exts
+
+      ac-a-spki-digest:
+        holder:
+          name: alice
+          cert: alice-a
+          include-base-cert-id: false
+          include-object-digest-info: true
+          digested-object-type: public_key
+        issuer: aa
+        issuer-cert: role-aa
+        attributes: *role-attrs
+        validity: *ac-validity
+        extensions: *target-exts
+
+      ac-a-certdigest:
+        holder:
+          name: alice
+          cert: alice-a
+          include-base-cert-id: false
+          include-object-digest-info: true
+          digested-object-type: public_key_cert
+        issuer: aa
+        issuer-cert: role-aa
+        attributes: *role-attrs
+        validity: *ac-validity
+        extensions: *target-exts
+
+      # Combined AND-binding: RFC 5755 says every present holder component
+      # must match. entityName matches all same-DN certs, but baseCertID
+      # pins it to alice-a only.
+      ac-a-combined:
+        holder:
+          name: alice
+          cert: alice-a
+          include-base-cert-id: true
+          include-entity-name: true
+        issuer: aa
+        issuer-cert: role-aa
+        attributes: *role-attrs
+        validity: *ac-validity
+        extensions: *target-exts
+
+      # ===================== GROUP B: bound to alice-c =====================
+      # The "same key, re-certified" certificate. These ACs prove that a
+      # whole-certificate / serial binding does NOT carry over to a renewed
+      # cert, whereas SPKI- and name-based bindings do.
+      ac-b-basecertid:
+        holder:
+          name: alice
+          cert: alice-c
+        issuer: aa
+        issuer-cert: role-aa
+        attributes: *role-attrs
+        validity: *ac-validity
+        extensions: *target-exts
+
+      ac-b-entityname:
+        holder:
+          name: alice
+          cert: alice-c
+          include-base-cert-id: false
+          include-entity-name: true
+        issuer: aa
+        issuer-cert: role-aa
+        attributes: *role-attrs
+        validity: *ac-validity
+        extensions: *target-exts
+
+      ac-b-spki-digest:
+        holder:
+          name: alice
+          cert: alice-c
+          include-base-cert-id: false
+          include-object-digest-info: true
+          digested-object-type: public_key
+        issuer: aa
+        issuer-cert: role-aa
+        attributes: *role-attrs
+        validity: *ac-validity
+        extensions: *target-exts
+
+      ac-b-certdigest:
+        holder:
+          name: alice
+          cert: alice-c
+          include-base-cert-id: false
+          include-object-digest-info: true
+          digested-object-type: public_key_cert
+        issuer: aa
+        issuer-cert: role-aa
+        attributes: *role-attrs
+        validity: *ac-validity
+        extensions: *target-exts

@@ -1,0 +1,198 @@
+# =============================================================================
+# Expected authorization conclusions for the holder-binding regression suite.
+#
+# reference_time sits inside every AC validity window, so time never explains
+# a failure here. All AC signatures are valid (issued by role-aa). The only
+# things that vary are the holder binding, the candidate PKC, and the target.
+#
+# `expected_reasons` lists the reason identifiers that MUST be present when
+# authorized == false. Reason identifiers live in checks/matcher.py.
+#
+# Candidate PKCs:
+#   alice-a : CN=Alice Holder, key alice-key-1, serial S_a   (original)
+#   alice-b : CN=Alice Holder, key alice-key-2, serial S_b   (same name/new key)
+#   alice-c : CN=Alice Holder, key alice-key-1, serial S_c   (same key/new cert)
+#   carol   : CN=Alice Holder, key carol-key,  serial S_x   (same name/foreign key)
+# =============================================================================
+reference_time: "2026-06-01T12:00:00+0000"
+targets:
+  payments: "Payments Service"      # listed in every targetInformation
+  readonly: "Readonly Service"      # listed in every targetInformation
+  other: "Other Service"            # never listed -> target restriction test
+
+cases:
+  # ---------------- Group A: attribute certificates bound to alice-a --------
+  - ac: ac-a-basecertid
+    binding: baseCertificateID
+    checks:
+      - candidate: alice-a
+        target: payments
+        authorized: true
+      - candidate: alice-a
+        target: other
+        authorized: false
+        expected_reasons: [target_not_authorized]
+      - candidate: alice-b            # same DN, different key/serial
+        target: payments
+        authorized: false
+        expected_reasons: [baseCertificateID_mismatch]
+      - candidate: alice-c            # same SPKI, renewed serial
+        target: payments
+        authorized: false
+        expected_reasons: [baseCertificateID_mismatch]
+      - candidate: carol              # same DN, foreign key
+        target: payments
+        authorized: false
+        expected_reasons: [baseCertificateID_mismatch]
+
+  - ac: ac-a-entityname
+    binding: entityName
+    checks:
+      - candidate: alice-a
+        target: payments
+        authorized: true
+      - candidate: alice-a
+        target: other
+        authorized: false
+        expected_reasons: [target_not_authorized]
+      - candidate: alice-b            # identical DN -> name binding matches
+        target: payments
+        authorized: true
+      - candidate: alice-c
+        target: readonly
+        authorized: true
+      - candidate: carol              # identical DN -> still name-matches
+        target: payments
+        authorized: true
+      # NOTE: entityName is the ONLY binding that a same-DN cert satisfies.
+      # This demonstrates that a bare subject string is a weak binding.
+
+  - ac: ac-a-spki-digest
+    binding: objectDigestInfo(public_key)
+    checks:
+      - candidate: alice-a
+        target: payments
+        authorized: true
+      - candidate: alice-a
+        target: other
+        authorized: false
+        expected_reasons: [target_not_authorized]
+      - candidate: alice-c            # same SPKI -> digest survives renewal
+        target: payments
+        authorized: true
+      - candidate: alice-b            # new key -> new SPKI
+        target: payments
+        authorized: false
+        expected_reasons: [spki_digest_mismatch]
+      - candidate: carol              # foreign key
+        target: payments
+        authorized: false
+        expected_reasons: [spki_digest_mismatch]
+
+  - ac: ac-a-certdigest
+    binding: objectDigestInfo(public_key_cert)
+    checks:
+      - candidate: alice-a
+        target: payments
+        authorized: true
+      - candidate: alice-a
+        target: other
+        authorized: false
+        expected_reasons: [target_not_authorized]
+      - candidate: alice-c            # same key but re-signed DER
+        target: payments
+        authorized: false
+        expected_reasons: [cert_digest_mismatch]
+      - candidate: alice-b
+        target: payments
+        authorized: false
+        expected_reasons: [cert_digest_mismatch]
+      - candidate: carol
+        target: payments
+        authorized: false
+        expected_reasons: [cert_digest_mismatch]
+
+  - ac: ac-a-combined
+    binding: "baseCertificateID AND entityName"
+    checks:
+      - candidate: alice-a            # both components match
+        target: payments
+        authorized: true
+      - candidate: alice-b            # name matches, serial does not
+        target: payments
+        authorized: false
+        expected_reasons: [baseCertificateID_mismatch]
+      - candidate: alice-c
+        target: payments
+        authorized: false
+        expected_reasons: [baseCertificateID_mismatch]
+      - candidate: carol
+        target: payments
+        authorized: false
+        expected_reasons: [baseCertificateID_mismatch]
+      # AND-semantics: the entityName match can never rescue a failed
+      # baseCertificateID, even though every candidate shares the DN.
+
+  # ---------------- Group B: attribute certificates bound to alice-c --------
+  # Proves the same facts from the renewed certificate's side. alice-c is the
+  # legitimate re-certified holder of the SAME key as alice-a.
+  - ac: ac-b-basecertid
+    binding: baseCertificateID
+    checks:
+      - candidate: alice-c
+        target: payments
+        authorized: true
+      - candidate: alice-a            # original cert, different serial
+        target: payments
+        authorized: false
+        expected_reasons: [baseCertificateID_mismatch]
+      - candidate: carol
+        target: payments
+        authorized: false
+        expected_reasons: [baseCertificateID_mismatch]
+
+  - ac: ac-b-entityname
+    binding: entityName
+    checks:
+      - candidate: alice-c
+        target: payments
+        authorized: true
+      - candidate: alice-a            # same DN
+        target: payments
+        authorized: true
+      - candidate: carol              # same DN
+        target: payments
+        authorized: true
+
+  - ac: ac-b-spki-digest
+    binding: objectDigestInfo(public_key)
+    checks:
+      - candidate: alice-c
+        target: payments
+        authorized: true
+      - candidate: alice-a            # identical SPKI (the same key)
+        target: payments
+        authorized: true
+      - candidate: alice-b
+        target: payments
+        authorized: false
+        expected_reasons: [spki_digest_mismatch]
+      - candidate: carol
+        target: payments
+        authorized: false
+        expected_reasons: [spki_digest_mismatch]
+
+  - ac: ac-b-certdigest
+    binding: objectDigestInfo(public_key_cert)
+    checks:
+      - candidate: alice-c
+        target: payments
+        authorized: true
+      - candidate: alice-a            # same key, different whole-cert DER
+        target: payments
+        authorized: false
+        expected_reasons: [cert_digest_mismatch]
+      - candidate: carol
+        target: payments
+        authorized: false
+        expected_reasons: [cert_digest_mismatch]
