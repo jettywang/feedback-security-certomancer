@@ -169,6 +169,74 @@ is sent back to the client.
 While the use case is obviously a bit contrived, it demonstrates how to integrate Certomancer
 with a cryptographic protocol for testing/mocking purposes.
 
+### Example: offline SCEP responder (`scep-responder`)
+
+The `scep_plugin` package (see [the source](../scep_plugin/responder.py)) contains a service
+plugin that implements a small, deliberately offline subset of the Simple Certificate Enrollment
+Protocol (SCEP, [RFC 8894](https://www.rfc-editor.org/rfc/rfc8894)). It exists to let device
+registration clients be exercised end to end without standing up a real certification authority.
+
+It is **not** a CA and never issues certificates: the only certificate an endpoint can ever return
+is the single Certomancer certificate named in its configuration, and it only does so when the
+public key in the request's PKCS#10 CSR is exactly that certificate's public key.
+
+The plugin handles these SCEP message types:
+
+* `PKCSReq` (messageType 19) &mdash; carries a CSR wrapped in a CMS EnvelopedData inside a CMS
+  SignedData ("double-wrapped") message;
+* `CertPoll` (messageType 20) &mdash; polls for the result of a previous request, carrying an
+  `IssuerAndSubject` payload;
+* `CertRep` (messageType 3) &mdash; the response produced by the plugin, with `pkiStatus`
+  `SUCCESS`, `PENDING` or `FAILURE`.
+For every request the plugin first verifies the outer CMS signature (including the
+`messageDigest` authenticated attribute and the signature over the universal-SET encoding of the
+authenticated attributes) and then decrypts the inner EnvelopedData. Only after both steps succeed
+does it inspect the SCEP authenticated attributes: `messageType`, `transactionID`,
+`senderNonce` and `recipientNonce`. Responses are signed by the configured RA certificate,
+encrypted for the *authenticated client* (the signer of the request), and echo the request's
+`senderNonce` back as the response's `recipientNonce`.
+
+Configuration keys for an endpoint:
+
+| Key | Meaning |
+| --- | --- |
+| `target-cert` | Label of the only certificate this endpoint may hand out. |
+| `responder-cert` | Certificate used to sign outer SignedData responses. |
+| `responder-key` | Key label holding the responder's private signing key (defaults to `responder-cert`). |
+| `recipient-cert` | Certificate whose public key clients encrypt incoming requests for. |
+| `recipient-key` | Key label used to decrypt incoming EnvelopedData (defaults to `recipient-cert`). |
+| `pending-first` | When `true`, the first `PKCSReq` returns `PENDING`; the following `CertPoll` returns the certificate. When `false` (the default), `PKCSReq` succeeds immediately. |
+
+A typical configuration (see [the test fixture](../tests/data/with-scep.yml)):
+
+```yaml
+plugin-modules: ["scep_plugin"]
+# ...
+services:
+  plugin:
+    scep-responder:
+      pending:
+        target-cert: scep-target
+        responder-cert: scep-ra
+        responder-key: interm
+        recipient-cert: scep-ra
+        recipient-key: interm
+        pending-first: true
+```
+
+Transactions are keyed on the client-supplied `transactionID` together with the endpoint label and
+kept in memory. A poll for an unknown `transactionID`, or one signed by a different certificate
+than the original request, is rejected and never returns a certificate. Algorithms outside the
+supported set (SHA-256/384/512 signatures, AES-128/192/256-CBC content encryption and
+RSAES-PKCS#1-v1_5 key transport) are rejected explicitly: an unsupported outer-signature algorithm
+surfaces as a bad request, while an unsupported envelope algorithm produces a SCEP `badAlg`
+`CertRep`.
+
+The accompanying tests in [tests/scep](../tests/scep) include an independently written SCEP
+client that constructs requests and unwraps/verifies responses without reusing the responder's
+envelope code, covering the pending-then-success flow and the CSR-key, transaction-ID and
+signature rejection cases.
+
 ### What if I need to do something more complicated?
 
 Certomancer's plugin system was designed to be easy to integrate with minimal configuration, which
